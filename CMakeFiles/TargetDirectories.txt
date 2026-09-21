@@ -1,2 +1,0 @@
-/home/cristian/SYCL_ML/tinyml/CMakeFiles/edit_cache.dir
-/home/cristian/SYCL_ML/tinyml/CMakeFiles/rebuild_cache.dir
