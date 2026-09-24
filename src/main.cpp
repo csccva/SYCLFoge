@@ -1436,7 +1436,7 @@ int main()
         const std::size_t K = 7;
         const std::size_t N = 6;
 
-        const std::size_t tile_size = 4;
+        const std::size_t tile_size = 16;
 
         std::vector<float> h_A(M * K);
         std::vector<float> h_B(K * N);
@@ -2327,6 +2327,170 @@ int main()
         std::cout << "Sum of differences in single " << sum_f/h_gelu_input.size() << " and double precision " << sum_d/h_gelu_input.size() << std::endl;
     }
 
+        // =========================================================
+    // Tiled MatMul Performance Test
+    // =========================================================
+    {
+        std::cout << "\n=== Tiled MatMul Performance Test ===\n";
+
+        const std::size_t M = 1024, K = 1024, N = 1024;
+        const std::size_t tile_size = 16;
+        const std::size_t warm_up = 10, measure = 100;
+
+        std::vector<float> h_A(M * K), h_B(K * N), h_C(M * N), h_reference(M * N);
+
+        for (std::size_t i = 0; i < M * K; i++) h_A[i] = static_cast<float>(i % 17) * 0.01f;
+        for (std::size_t i = 0; i < K * N; i++) h_B[i] = static_cast<float>(i % 13) * 0.01f;
+
+        tinyml::Tensor<float> A(queue, {M,K}), B(queue, {K,N}), C(queue, {M,N});
+
+        ops::copy_to_device(queue, A, h_A.data()).wait_and_throw();
+        ops::copy_to_device(queue, B, h_B.data()).wait_and_throw();
+
+        // Warm-up
+        for (std::size_t i = 0; i < warm_up; i++) {
+            ops::matmul_tiled(queue, A, B, C, tile_size).wait_and_throw();
+        }
+
+        // GPU execution time
+        std::vector<sycl::event> events;
+        events.reserve(measure);
+
+        sycl::event e = ops::matmul_tiled(queue, A, B, C, tile_size);
+        events.push_back(e);
+
+        for (std::size_t i = 1; i < measure; i++) {
+            e = ops::matmul_tiled(queue, A, B, C, tile_size, {e});
+            events.push_back(e);
+        }
+
+        e.wait_and_throw();
+
+        double total_time = 0.0;
+
+        for (const auto& event : events) {
+            auto start = event.get_profiling_info<sycl::info::event_profiling::command_start>();
+            auto end = event.get_profiling_info<sycl::info::event_profiling::command_end>();
+            total_time += static_cast<double>(end - start);
+        }
+
+        double average_ms = total_time / (1.0e6 * static_cast<double>(measure));
+        double gflops = (2.0 * static_cast<double>(M) * K * N) / (average_ms * 1.0e6);
+
+        std::cout << "Matrix dimensions: " << M << " x " << K << " x " << N << "\n";
+        std::cout << "Tile size: " << tile_size << "\n";
+        std::cout << "Average execution time: " << average_ms << " ms\n";
+        std::cout << "Performance: " << gflops << " GFLOP/s\n";
+
+        // Copy result to host
+        ops::copy_to_host(queue, h_C.data(), C, {e}).wait_and_throw();
+
+        // Independent CPU reference
+        for (std::size_t i = 0; i < M; i++) {
+            for (std::size_t j = 0; j < N; j++) {
+                double value = 0.0;
+                for (std::size_t k = 0; k < K; k++) value += static_cast<double>(h_A[i * K + k]) * h_B[k * N + j];
+                h_reference[i * N + j] = static_cast<float>(value);
+            }
+        }
+
+        // Numerical validation
+        float max_diff = 0.0f;
+        bool finite_results = true;
+
+        for (std::size_t i = 0; i < M * N; i++) {
+            if (!std::isfinite(h_C[i])) {
+                finite_results = false;
+                continue;
+            }
+            max_diff = std::max(max_diff, std::abs(h_C[i] - h_reference[i]));
+        }
+
+        std::cout << "Maximum difference: " << max_diff << "\n";
+
+        if (finite_results && max_diff < 1.0e-4f) {
+            std::cout << "Tiled MatMul Performance test PASSED\n";
+        }
+        else {
+            std::cout << "Tiled MatMul Performance test FAILED\n";
+            all_tests_passed = false;
+        }
+    }
+
+    {
+        std::cout << "\n=== Tiled Transposed MatMul Test ===\n";
+    
+        const std::size_t M = 3;
+        const std::size_t K = 5;
+        const std::size_t N = 4;
+        const std::size_t tile_size = 2;
+    
+        tinyml::Tensor<float> A(queue,{M,K});
+        tinyml::Tensor<float> B(queue,{N,K});
+        tinyml::Tensor<float> C(queue,{M,N});
+    
+        std::vector<float> h_A = {
+             1,  2,  3,  4,  5,
+             6,  7,  8,  9, 10,
+            11, 12, 13, 14, 15
+        };
+    
+        std::vector<float> h_B = {
+             1,  2,  1,  2,  1,
+             2,  1,  2,  1,  2,
+             1,  1,  1,  1,  1,
+             2,  2,  2,  2,  2
+        };
+    
+        std::vector<float> h_C(M*N);
+        std::vector<float> h_ref(M*N,0.0f);
+    
+        auto e1 = ops::copy_to_device(queue,A,h_A.data());
+        auto e2 = ops::copy_to_device(queue,B,h_B.data());
+    
+        auto e3 = ops::matmul_tiled_transposed(queue,A,B,C,tile_size,{e1,e2});
+        auto e4 = ops::copy_to_host(queue,h_C.data(),C,{e3});
+        e4.wait();
+    
+        // CPU reference: C[i,j] = sum_k A[i,k] * B[j,k]
+        for(std::size_t i=0; i<M; i++){
+            for(std::size_t j=0; j<N; j++){
+                for(std::size_t k=0; k<K; k++){
+                    h_ref[i*N+j] += h_A[i*K+k]*h_B[j*K+k];
+                }
+            }
+        }
+    
+        float max_diff=0.0f;
+    
+        std::cout << "GPU result:\n";
+        for(std::size_t i=0; i<M; i++){
+            for(std::size_t j=0; j<N; j++){
+                std::cout << h_C[i*N+j] << " ";
+                max_diff=std::max(max_diff,std::abs(h_C[i*N+j]-h_ref[i*N+j]));
+            }
+            std::cout << "\n";
+        }
+    
+        std::cout << "CPU reference:\n";
+        for(std::size_t i=0; i<M; i++){
+            for(std::size_t j=0; j<N; j++){
+                std::cout << h_ref[i*N+j] << " ";
+            }
+            std::cout << "\n";
+        }
+    
+        std::cout << "Maximum difference: " << max_diff << "\n";
+    
+        if(max_diff < 1e-5f){
+            std::cout << "Tiled Transposed MatMul test PASSED\n";
+        }
+        else{
+            std::cout << "Tiled Transposed MatMul test FAILED\n";
+        }
+    }
+
+    
     // =========================================================
     // Final test summary
     // =========================================================
