@@ -5,10 +5,170 @@
 #include <vector>
 #include <stdexcept>
 #include <limits>
+#include <numbers>
 #include "tinyml/tensor.hpp"
 
-
+constexpr float eps = 1.0e-5f;
 namespace ops{
+    
+    
+    template <typename T>
+    sycl::event gelu_approx(sycl::queue& queue, T *data,T *Activation, std::size_t counts, std::size_t group_size, const std::vector<sycl::event>& dependencies={}){
+
+        return queue.parallel_for(sycl::nd_range<1>(((counts + group_size - 1) / group_size) * group_size,group_size),dependencies, [=](sycl::nd_item<1> item)
+        {
+            std::size_t index=item.get_global_id(0);
+            if (index < counts) {
+                T x=data[index];
+                T local_Activation=static_cast<T>(0.5)*x*(static_cast<T>(1.0)+sycl::tanh(sycl::sqrt(static_cast<T>(2.0)/std::numbers::pi_v<T>)*(x+static_cast<T>(0.044715)*x*x*x)));
+                //T local_Activation=sycl::tanh(x);
+                Activation[index]=local_Activation;
+            }
+
+        });
+    }
+
+    template <typename T>
+    sycl::event gelu_approx(sycl::queue& queue, tinyml::Tensor<T>& tensor, tinyml::Tensor<T>& Activation, std::size_t group_size, const std::vector<sycl::event>& dependencies={}){
+        if ( tensor.shape() != Activation.shape() ) {
+            throw std::invalid_argument("gelu_approx: tensor shapes must match");
+        }
+        return gelu_approx(queue,tensor.data(),Activation.data(),tensor.size(),group_size,dependencies);
+
+    }
+
+    template <typename T>
+    sycl::event gelu_exact(sycl::queue& queue, T *data,T *Activation, std::size_t counts, std::size_t group_size, const std::vector<sycl::event>& dependencies={}){
+
+        return queue.parallel_for(sycl::nd_range<1>(((counts + group_size - 1) / group_size) * group_size,group_size),dependencies, [=](sycl::nd_item<1> item)
+        {
+            std::size_t index=item.get_global_id(0);
+            if (index < counts) {
+                T x=data[index];
+                T local_Activation=static_cast<T>(0.5)*x*(static_cast<T>(1.0)+sycl::erf(x/sycl::sqrt(static_cast<T>(2.0))));
+                //T local_Activation=sycl::erf(x);
+                Activation[index]=local_Activation;
+            }
+
+        });
+    }
+
+    template <typename T>
+    sycl::event gelu_exact(sycl::queue& queue, tinyml::Tensor<T>& tensor, tinyml::Tensor<T>& Activation, std::size_t group_size, const std::vector<sycl::event>& dependencies={}){
+        if ( tensor.shape() != Activation.shape() ) {
+            throw std::invalid_argument("gelu_exact: tensor shapes must match");
+        }
+        return gelu_exact(queue,tensor.data(),Activation.data(),tensor.size(),group_size,dependencies);
+
+    }
+
+    template <typename T>
+    sycl::event layer_norm_parallel(sycl::queue& queue,T *input, T *output, std::size_t M, std::size_t N, std::size_t group_size, const std::vector<sycl::event>& dependencies={}){
+        return queue.submit([&](sycl::handler& h) {        
+                sycl::local_accessor<T, 1> local_A(sycl::range<1>(group_size), h); // to store the intermidiate max value and later the intermidiate sums
+                h.depends_on(dependencies);           
+
+                h.parallel_for(sycl::nd_range<1>(M*group_size,group_size), [=](sycl::nd_item<1> item)
+                {
+                    std::size_t i_row = item.get_group(0);                
+                    std::size_t local_j= item.get_local_id(0);
+                                                           
+                    T row_sum=static_cast<T>(0);
+                    if(local_j<N){
+                        row_sum=input[i_row*N+local_j]; //work item maximum
+                    }
+                    for(std::size_t j=local_j+group_size;j<N;j+=group_size){
+                        row_sum+=input[i_row*N+j];
+                    }
+                    local_A[local_j]=row_sum;
+                    item.barrier(sycl::access::fence_space::local_space); // barrier within the group
+                    for(std::size_t stride = group_size / 2;stride>0;stride>>=1){
+                        if(local_j<stride){
+                            local_A[local_j]+=local_A[local_j+stride];
+                        }
+                        item.barrier(sycl::access::fence_space::local_space); // barrier within the group
+                    }        
+                    row_sum= local_A[0]/static_cast<T>(N); 
+
+                    item.barrier(sycl::access::fence_space::local_space); // barrier within the group //not needed here
+                    T row_var=static_cast<T>(0);
+                    if(local_j<N){
+                        row_var=(input[i_row*N+local_j]-row_sum)*(input[i_row*N+local_j]-row_sum); //work item maximum
+                    }
+                    for(std::size_t j=local_j+group_size;j<N;j+=group_size){
+                        row_var+=(input[i_row*N+j]-row_sum)*(input[i_row*N+j]-row_sum); //input[i_row*N+j];
+                    }
+                    local_A[local_j]=row_var;
+                    item.barrier(sycl::access::fence_space::local_space); // barrier within the group
+                    for(std::size_t stride = group_size / 2;stride>0;stride>>=1){
+                        if(local_j<stride){
+                            local_A[local_j]+=local_A[local_j+stride];
+                        }
+                        item.barrier(sycl::access::fence_space::local_space); // barrier within the group
+                    }        
+                    row_var= local_A[0]/static_cast<T>(N);
+                    //item.barrier(sycl::access::fence_space::local_space); // barrier within the group //not needed here
+                    
+                    for(std::size_t j=local_j;j<N;j+=group_size){
+                        output[i_row*N+j]=(input[i_row*N+j]-row_sum)/sycl::sqrt(row_var+eps);
+                    }   
+                }
+            );
+        });
+    }
+
+    
+    template <typename T>
+    sycl::event layer_norm_parallel(sycl::queue& queue,tinyml::Tensor<T>& input, tinyml::Tensor<T>& output, std::size_t group_size, const std::vector<sycl::event>& dependencies={}){
+        if (input.shape().size() != 2 || output.shape().size() != 2 || input.shape() != output.shape() ||  input.shape()[0] == 0 ||  input.shape()[1] == 0) {
+            throw std::invalid_argument("layer_norm_parallel: tensors must be 2D, non-empty, and have matching shapes");
+        }
+        if (group_size == 0 || (group_size & (group_size - 1)) != 0) {
+            throw std::invalid_argument("layer_norm_parallel: group_size must be a power of 2");
+        }
+        std::size_t M=input.shape()[0];
+        std::size_t N=input.shape()[1];
+        return layer_norm_parallel(queue,input.data(), output.data(), M, N, group_size, dependencies);
+    }
+
+    template <typename T>
+    sycl::event layer_norm(sycl::queue& queue,T *input, T *output, std::size_t M, std::size_t N, std::size_t group_size, const std::vector<sycl::event>& dependencies={}){
+        return queue.parallel_for(sycl::nd_range<1>(((M + group_size - 1) / group_size) * group_size,group_size),dependencies, [=](sycl::nd_item<1> item)
+        {
+            std::size_t index=item.get_global_id(0);
+            std::size_t i_start=index*N;
+            if (index < M) {
+                T row_sum=input[i_start];
+                for(std::size_t j=i_start+1;j<i_start+N;j++){
+                    row_sum+=input[j];
+                }
+                row_sum/=static_cast<T>(N);
+                T row_var=(input[i_start]-row_sum)*(input[i_start]-row_sum);
+                for(std::size_t j=i_start+1;j<i_start+N;j++){
+                    row_var+=(input[j]-row_sum)*(input[j]-row_sum);
+                }
+                row_var/=static_cast<T>(N);
+                for(std::size_t j=i_start;j<i_start+N;j++){
+                    output[j]=(input[j]-row_sum)/sycl::sqrt(row_var+eps);
+                }
+            }
+        });
+    }
+ 
+    
+    template <typename T>
+    sycl::event layer_norm(sycl::queue& queue, tinyml::Tensor<T>& input, tinyml::Tensor<T>& output, std::size_t group_size, const std::vector<sycl::event>& dependencies={}){
+        
+        if (input.shape().size() != 2 || output.shape().size() != 2 || input.shape() != output.shape() ||  input.shape()[0] == 0 || input.shape()[1] == 0) {
+            throw std::invalid_argument("softmax: tensors must be 2D, non-empty, and have matching shapes");
+        }
+        if (group_size == 0) {
+            throw std::invalid_argument("layer_norm: group_size must be larger than");
+        }
+        std::size_t M=input.shape()[0];
+        std::size_t N=input.shape()[1];
+        return layer_norm(queue,input.data(), output.data(), M, N, group_size, dependencies);
+    }
 
     template <typename T>
     sycl::event softmax_parallel(sycl::queue& queue,T *input, T *output, std::size_t M, std::size_t N, std::size_t group_size, const std::vector<sycl::event>& dependencies={}){
@@ -66,11 +226,10 @@ namespace ops{
     }
 
     
-
     template <typename T>
     sycl::event softmax_parallel(sycl::queue& queue,tinyml::Tensor<T>& input, tinyml::Tensor<T>& output, std::size_t group_size, const std::vector<sycl::event>& dependencies={}){
         if (input.shape().size() != 2 || output.shape().size() != 2 || input.shape() != output.shape() ||  input.shape()[0] == 0 ||  input.shape()[1] == 0) {
-            throw std::invalid_argument("softmax: tensors must be 2D, non-empty, and have matching shapes");
+            throw std::invalid_argument("softmax_parllel: tensors must be 2D, non-empty, and have matching shapes");
         }
         if (group_size == 0 || (group_size & (group_size - 1)) != 0) {
             throw std::invalid_argument("softmax_parallel: group_size must be a power of 2");
@@ -102,7 +261,6 @@ namespace ops{
         });
     }
 
-    
 
     template <typename T>
     sycl::event softmax(sycl::queue& queue, tinyml::Tensor<T>& input, tinyml::Tensor<T>& output, std::size_t group_size, const std::vector<sycl::event>& dependencies={}){
