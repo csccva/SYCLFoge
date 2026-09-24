@@ -2490,7 +2490,84 @@ int main()
         }
     }
 
+    {
+        std::cout << "\n=== Scaled Tiled Transposed MatMul Test ===\n";
     
+        const std::size_t M=4;
+        const std::size_t K=8;
+        const std::size_t N=4;
+        const std::size_t tile_size=2;
+    
+        std::vector<float> h_Q={
+            1,2,3,4,5,6,7,8,
+            2,1,2,1,2,1,2,1,
+            1,1,1,1,1,1,1,1,
+            8,7,6,5,4,3,2,1
+        };
+    
+        std::vector<float> h_K={
+            1,0,1,0,1,0,1,0,
+            0,1,0,1,0,1,0,1,
+            1,1,1,1,1,1,1,1,
+            2,2,2,2,2,2,2,2
+        };
+    
+        std::vector<float> h_scores(M*N);
+        std::vector<float> h_reference(M*N,0.0f);
+    
+        tinyml::Tensor<float> Q(queue,{M,K});
+        tinyml::Tensor<float> K_tensor(queue,{N,K});
+        tinyml::Tensor<float> scores(queue,{M,N});
+    
+        auto e1=ops::copy_to_device(queue,Q,h_Q.data());
+        auto e2=ops::copy_to_device(queue,K_tensor,h_K.data());
+    
+        auto e3=ops::matmul_tiled_transposed_scaled(queue,Q,K_tensor,scores,tile_size,{e1,e2});
+        auto e4=ops::copy_to_host(queue,h_scores.data(),scores,{e3});
+        e4.wait();
+    
+        float scale=1.0f/std::sqrt(static_cast<float>(K));
+    
+        for(std::size_t i=0;i<M;i++){
+            for(std::size_t j=0;j<N;j++){
+                for(std::size_t k=0;k<K;k++){
+                    h_reference[i*N+j]+=h_Q[i*K+k]*h_K[j*K+k];
+                }
+                h_reference[i*N+j]*=scale;
+            }
+        }
+    
+        float max_diff=0.0f;
+    
+        for(std::size_t i=0;i<M*N;i++){
+            max_diff=std::max(max_diff,std::abs(h_scores[i]-h_reference[i]));
+        }
+    
+        std::cout << "GPU result:\n";
+        for(std::size_t i=0;i<M;i++){
+            for(std::size_t j=0;j<N;j++){
+                std::cout << h_scores[i*N+j] << " ";
+            }
+            std::cout << "\n";
+        }
+    
+        std::cout << "CPU reference:\n";
+        for(std::size_t i=0;i<M;i++){
+            for(std::size_t j=0;j<N;j++){
+                std::cout << h_reference[i*N+j] << " ";
+            }
+            std::cout << "\n";
+        }
+    
+        std::cout << "Maximum difference: " << max_diff << "\n";
+    
+        if(max_diff<1e-5f){
+            std::cout << "Scaled Tiled Transposed MatMul test PASSED\n";
+        }
+        else{
+            std::cout << "Scaled Tiled Transposed MatMul test FAILED\n";
+        }
+    }
     // =========================================================
     // Final test summary
     // =========================================================

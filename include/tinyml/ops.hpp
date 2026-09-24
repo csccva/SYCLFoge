@@ -11,7 +11,80 @@
 constexpr float eps = 1.0e-5f;
 namespace ops{
     
+
+    template <typename T>
+    sycl::event matmul_tiled_transposed_scaled(sycl::queue& queue,T *a, T *b, T *c,std::size_t M,std::size_t K,std::size_t N, std::size_t tile_size, const std::vector<sycl::event>& dependencies={})
+    {
+        std::size_t global_rows = ((M + tile_size - 1) / tile_size) * tile_size;
+        std::size_t global_cols = ((N + tile_size - 1) / tile_size) * tile_size;
     
+        return queue.submit([&](sycl::handler& h) {
+            sycl::local_accessor<T, 2> local_A(sycl::range<2>(tile_size, tile_size+1), h);
+            sycl::local_accessor<T, 2> local_B(sycl::range<2>(tile_size, tile_size+1), h);
+            h.depends_on(dependencies);
+    
+            h.parallel_for(sycl::nd_range<2>(sycl::range<2>(global_rows, global_cols),sycl::range<2>(tile_size, tile_size)), [=](sycl::nd_item<2> item)
+            {
+                std::size_t row = item.get_global_id(0);
+                std::size_t col = item.get_global_id(1);
+    
+                std::size_t local_row = item.get_local_id(0);
+                std::size_t local_col = item.get_local_id(1);
+    
+                std::size_t b_row = col - local_col + local_row;
+    
+                T local_cij=static_cast<T>(0);
+    
+                for (std::size_t tile_start=0; tile_start<K; tile_start+=tile_size)
+                {
+                    if(row<M && (tile_start+local_col)<K){
+                        local_A[local_row][local_col]=a[row*K+(tile_start+local_col)];
+                    }
+                    else{
+                        local_A[local_row][local_col]=static_cast<T>(0);
+                    }
+    
+                    if(b_row<N && (tile_start+local_col)<K){
+                        local_B[local_row][local_col]=b[b_row*K+(tile_start+local_col)];
+                    }
+                    else{
+                        local_B[local_row][local_col]=static_cast<T>(0);
+                    }
+    
+                    item.barrier(sycl::access::fence_space::local_space);
+    
+                    for(std::size_t k=0; k<tile_size; k++){
+                        local_cij+=local_A[local_row][k]*local_B[local_col][k];
+                    }
+    
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+    
+                if(row<M && col<N){
+                    c[row*N+col]=local_cij/sycl::sqrt(static_cast<T>(K));
+                }
+            });
+        });
+    }
+    
+    
+    template <typename T>
+    sycl::event matmul_tiled_transposed_scaled(sycl::queue& queue,tinyml::Tensor<T>& a, tinyml::Tensor<T>& b, tinyml::Tensor<T>& c, std::size_t tile_size, const std::vector<sycl::event>& dependencies={})
+    {
+        if(a.shape().size()!=2 || b.shape().size()!=2 || c.shape().size()!=2 ||
+           a.shape()[1]!=b.shape()[1] ||
+           c.shape()[0]!=a.shape()[0] ||
+           c.shape()[1]!=b.shape()[0]){
+            throw std::invalid_argument("matmul_tiled_transposed: tensor shapes must match");
+        }
+    
+        std::size_t M=a.shape()[0];
+        std::size_t K=a.shape()[1];
+        std::size_t N=b.shape()[0];
+    
+        return matmul_tiled_transposed_scaled(queue,a.data(),b.data(),c.data(),M,K,N,tile_size,dependencies);
+    }
+  
 
     template <typename T>
     sycl::event matmul_tiled_transposed(sycl::queue& queue,T *a, T *b, T *c,std::size_t M,std::size_t K,std::size_t N, std::size_t tile_size, const std::vector<sycl::event>& dependencies={})
@@ -21,7 +94,7 @@ namespace ops{
     
         return queue.submit([&](sycl::handler& h) {
             sycl::local_accessor<T, 2> local_A(sycl::range<2>(tile_size, tile_size+1), h);
-            sycl::local_accessor<T, 2> local_B(sycl::range<2>(tile_size, tile_size), h);
+            sycl::local_accessor<T, 2> local_B(sycl::range<2>(tile_size, tile_size+1), h);
             h.depends_on(dependencies);
     
             h.parallel_for(sycl::nd_range<2>(sycl::range<2>(global_rows, global_cols),sycl::range<2>(tile_size, tile_size)), [=](sycl::nd_item<2> item)
