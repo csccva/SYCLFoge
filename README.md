@@ -72,17 +72,46 @@ Current operations include:
 - softmax
 - layer normalization
 - matrix multiplication
+- tiled matrix multiplication
+- tiled multiplication with a transposed second operand
+- scaled tiled multiplication with a transposed second operand
 
 Operations return `sycl::event` objects so dependencies between asynchronous GPU operations can be expressed explicitly.
 
 ### Matrix multiplication
 
-Two matrix multiplication implementations are currently available:
+Several matrix multiplication operations are currently available:
 
 - naïve matrix multiplication
 - tiled matrix multiplication using SYCL local memory
+- tiled `AB^T` matrix multiplication
+- scaled tiled `AB^T` matrix multiplication for attention
 
-The tiled implementation is intended primarily for learning GPU optimization techniques. It is not intended to replace optimized BLAS implementations.
+The transposed operation computes:
+
+\[
+C = AB^T
+\]
+
+for:
+
+- `A` with shape `[M, K]`
+- `B` with shape `[N, K]`
+- `C` with shape `[M, N]`
+
+This avoids explicitly constructing a transposed copy of `B`.
+
+A scaled version computes:
+
+\[
+C = \frac{AB^T}{\sqrt{K}}
+\]
+
+which provides the score computation required by scaled dot-product attention when `A = Q`, `B = K`, and the matrix dimension `K` corresponds to the attention dimension \(d_k\).
+
+The tiled implementations use SYCL local memory to reuse matrix data within work-groups. Local-memory padding is used in the transposed implementation to reduce unfavorable strided bank-access patterns.
+
+The matrix multiplication kernels are intended primarily for learning GPU optimization techniques. They are not intended to replace optimized BLAS implementations.
 
 ### Linear layer
 
@@ -148,6 +177,8 @@ Both serial and parallel GPU implementations of softmax are available.
 
 The parallel implementation uses work-group reductions to compute the normalization across rows and serves as an exercise in implementing reduction-based neural-network operations with SYCL.
 
+This operation will be used to normalize the scaled \(QK^T\) scores in scaled dot-product attention.
+
 ### Layer normalization
 
 Both serial and parallel implementations of layer normalization are available.
@@ -177,6 +208,39 @@ Y [batch, 2]
 The neural-network operations are executed on the GPU, with input data and parameters explicitly transferred to device memory.
 
 Dependencies between parameter transfers and successive operations are expressed using `sycl::event` objects, allowing kernels to be chained without requiring host synchronization between layers.
+
+### Attention primitives
+
+Development of scaled dot-product attention is in progress.
+
+The target operation is:
+
+\[
+\mathrm{Attention}(Q,K,V)
+=
+\mathrm{softmax}
+\left(
+\frac{QK^T}{\sqrt{d_k}}
+\right)V
+\]
+
+The first stage is already implemented as a fused scaled transposed matrix multiplication:
+
+```text
+Q [Lq, dk] ──┐
+             ├── scaled QK^T ──> scores [Lq, Lk]
+K [Lk, dk] ──┘
+```
+
+The implementation computes:
+
+\[
+\mathrm{scores} = \frac{QK^T}{\sqrt{d_k}}
+\]
+
+without explicitly transposing `K` and without requiring a separate scaling kernel.
+
+The scaled operation has been validated against a CPU reference. The next step is to connect it to the existing parallel softmax implementation, followed by multiplication of the resulting attention weights with `V`.
 
 ## Design principles
 
@@ -234,7 +298,7 @@ Run with:
 
 The next major steps are:
 
-- scaled dot-product attention
+- complete single-head scaled dot-product attention
 - multi-head attention
 - embeddings
 - transformer blocks
@@ -242,12 +306,16 @@ The next major steps are:
 - tiny Transformer inference
 - further GPU kernel optimization
 
+Possible later optimization work includes fusing attention operations and exploring blockwise/online softmax approaches to reduce intermediate global-memory traffic.
+
 Longer term, the project may explore automatic differentiation and training.
 
 ## Status
 
 Work in progress.
 
-The project currently supports a basic end-to-end GPU inference pipeline composed from tensors, custom SYCL kernels, linear layers, activation functions, softmax, and layer normalization. Exact and approximate GELU implementations are available, together with numerical correctness tests and GPU profiling experiments.
+The project currently supports a basic end-to-end GPU inference pipeline composed from tensors, custom SYCL kernels, linear layers, activation functions, softmax, and layer normalization.
 
-This is an educational project for exploring C++, SYCL, GPU programming, and the internals of machine-learning frameworks. The kernels are intentionally implemented directly rather than delegating the work to optimized ML or BLAS libraries.
+Development has now reached the attention stage. Tiled `AB^T` multiplication and scaled \(QK^T/\sqrt{d_k}\) are implemented and tested, providing the first stage required for scaled dot-product attention. The next step is to connect the scaled score calculation with the existing parallel softmax implementation and then multiply the attention weights by `V`.
+
+This is an educational project for exploring C++, SYCL, GPU programming, GPU memory-access patterns, parallel reductions, and the internals of machine-learning frameworks. The kernels are intentionally implemented directly rather than delegating the work to optimized ML or BLAS libraries.
