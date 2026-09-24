@@ -64,8 +64,13 @@ Current operations include:
 - host/device copies
 - elementwise arithmetic
 - fill
+- scalar multiplication
 - bias addition
 - ReLU
+- exact GELU
+- approximate GELU
+- softmax
+- layer normalization
 - matrix multiplication
 
 Operations return `sycl::event` objects so dependencies between asynchronous GPU operations can be expressed explicitly.
@@ -98,11 +103,56 @@ The matrix multiplication and bias kernels are connected through SYCL event depe
 
 ### Activation functions
 
-ReLU is currently implemented as a SYCL GPU kernel:
+ReLU and GELU activation functions are implemented as SYCL GPU kernels.
+
+ReLU:
 
 \[
 \mathrm{ReLU}(x) = \max(0,x)
 \]
+
+Two GELU implementations are available:
+
+- exact GELU using the error function
+- approximate GELU using the tanh approximation
+
+The exact formulation is:
+
+\[
+\mathrm{GELU}(x) =
+\frac{x}{2}
+\left(
+1 + \mathrm{erf}\left(\frac{x}{\sqrt{2}}\right)
+\right)
+\]
+
+The approximate formulation is:
+
+\[
+\mathrm{GELU}(x) \approx
+\frac{x}{2}
+\left[
+1 +
+\tanh\left(
+\sqrt{\frac{2}{\pi}}
+\left(x + 0.044715x^3\right)
+\right)
+\right]
+\]
+
+Both implementations have been tested against CPU references. The exact and approximate implementations have also been compared for numerical accuracy and GPU execution time using SYCL event profiling.
+
+### Softmax
+
+Both serial and parallel GPU implementations of softmax are available.
+
+The parallel implementation uses work-group reductions to compute the normalization across rows and serves as an exercise in implementing reduction-based neural-network operations with SYCL.
+
+### Layer normalization
+
+Both serial and parallel implementations of layer normalization are available.
+
+The parallel implementation uses SYCL work-group reductions to compute row statistics. The implementation is primarily intended for learning parallel reduction techniques and floating-point behavior on GPUs.
 
 ### Feed-forward network
 
@@ -115,7 +165,7 @@ X [batch, 2]
 Linear(2, 4)
     |
     v
-ReLU
+ReLU / GELU
     |
     v
 Linear(4, 2)
@@ -184,11 +234,9 @@ Run with:
 
 The next major steps are:
 
-- additional activation functions
-- softmax
+- scaled dot-product attention
+- multi-head attention
 - embeddings
-- normalization
-- attention
 - transformer blocks
 - token/weight loading
 - tiny Transformer inference
@@ -200,6 +248,6 @@ Longer term, the project may explore automatic differentiation and training.
 
 Work in progress.
 
-The project currently supports a basic end-to-end GPU inference pipeline composed from tensors, custom SYCL kernels, linear layers, and activation functions.
+The project currently supports a basic end-to-end GPU inference pipeline composed from tensors, custom SYCL kernels, linear layers, activation functions, softmax, and layer normalization. Exact and approximate GELU implementations are available, together with numerical correctness tests and GPU profiling experiments.
 
 This is an educational project for exploring C++, SYCL, GPU programming, and the internals of machine-learning frameworks. The kernels are intentionally implemented directly rather than delegating the work to optimized ML or BLAS libraries.
