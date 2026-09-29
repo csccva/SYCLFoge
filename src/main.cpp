@@ -11,6 +11,108 @@
 #include "tinyml/linear.hpp"
 
 
+void test_attention_max_size(sycl::queue& queue)
+{
+    const std::size_t K=128;
+    const std::size_t tile_size=16;
+
+    std::vector<std::size_t> sizes={12288,16384,24576,32768,49152,65536};
+
+    std::cout << "\n=== Attention Maximum Size Test ===\n";
+    std::cout << "K=" << K << ", tile=" << tile_size << "\n";
+
+    // ============================================================
+    // UNFUSED
+    // ============================================================
+
+    std::cout << "\n--- UNFUSED ---\n";
+
+    for(std::size_t N:sizes){
+        std::size_t M=N;
+
+        double intermediate_gib=2.0*static_cast<double>(M)*static_cast<double>(N)*sizeof(float)/(1024.0*1024.0*1024.0);
+
+        std::cout << "\nSize " << N << " x " << N << "\n";
+        std::cout << "scores + weights = " << intermediate_gib << " GiB\n";
+
+        try{
+            tinyml::Tensor<float> Q(queue,{M,K});
+            tinyml::Tensor<float> K_tensor(queue,{N,K});
+            tinyml::Tensor<float> V(queue,{N,K});
+            tinyml::Tensor<float> scores(queue,{M,N});
+            tinyml::Tensor<float> weights(queue,{M,N});
+            tinyml::Tensor<float> output(queue,{M,K});
+
+            auto e1=ops::fill(queue,Q,0.01f,256);
+            auto e2=ops::fill(queue,K_tensor,0.02f,256);
+            auto e3=ops::fill(queue,V,0.03f,256);
+
+            auto e4=ops::matmul_tiled_transposed_scaled(queue,Q,K_tensor,scores,tile_size,{e1,e2});
+            auto e5=ops::softmax_parallel(queue,scores,weights,256,{e4});
+            auto e6=ops::matmul_tiled(queue,weights,V,output,tile_size,{e5,e3});
+
+            e6.wait_and_throw();
+
+            std::cout << "SUCCESS\n";
+        }
+        catch(const sycl::exception& e){
+            std::cout << "FAILED\n";
+            std::cout << "SYCL error: " << e.what() << "\n";
+            break;
+        }
+        catch(const std::exception& e){
+            std::cout << "FAILED\n";
+            std::cout << "Error: " << e.what() << "\n";
+            break;
+        }
+    }
+
+    // Make sure everything from the unfused test is finished
+    // and its tensors have gone out of scope before testing fused.
+    queue.wait_and_throw();
+
+    // ============================================================
+    // FUSED
+    // ============================================================
+
+    std::cout << "\n--- FUSED ---\n";
+
+    for(std::size_t N:sizes){
+        std::size_t M=N;
+
+        std::cout << "\nSize " << N << " x " << N << "\n";
+
+        try{
+            tinyml::Tensor<float> Q(queue,{M,K});
+            tinyml::Tensor<float> K_tensor(queue,{N,K});
+            tinyml::Tensor<float> V(queue,{N,K});
+            tinyml::Tensor<float> output(queue,{M,K});
+
+            auto e1=ops::fill(queue,Q,0.01f,256);
+            auto e2=ops::fill(queue,K_tensor,0.02f,256);
+            auto e3=ops::fill(queue,V,0.03f,256);
+
+            auto e4=ops::attention_scores_online(queue,Q,K_tensor,V,output,tile_size,{e1,e2,e3});
+
+            e4.wait_and_throw();
+
+            std::cout << "SUCCESS\n";
+        }
+        catch(const sycl::exception& e){
+            std::cout << "FAILED\n";
+            std::cout << "SYCL error: " << e.what() << "\n";
+            break;
+        }
+        catch(const std::exception& e){
+            std::cout << "FAILED\n";
+            std::cout << "Error: " << e.what() << "\n";
+            break;
+        }
+    }
+
+    std::cout << "\n=== Maximum Size Test Finished ===\n";
+}
+
 int main()
 {
     //sycl::queue queue{sycl::gpu_selector_v};
@@ -2867,7 +2969,585 @@ int main()
     }
 }
 
+{
+    std::cout << "\n=== Fused Online Attention Test ===\n";
 
+    const std::size_t M=3, N=5, K=8;
+    const std::size_t tile_size=2;
+
+    std::vector<float> h_Q={
+        1,2,3,4,5,6,7,8,
+        2,1,2,1,2,1,2,1,
+        1,1,1,1,1,1,1,1
+    };
+
+    std::vector<float> h_K={
+        1,0,1,0,1,0,1,0,
+        0,1,0,1,0,1,0,1,
+        1,1,1,1,1,1,1,1,
+        2,2,2,2,2,2,2,2,
+        1,2,1,2,1,2,1,2
+    };
+
+    std::vector<float> h_V={
+        1,2,3,4,5,6,7,8,
+        2,3,4,5,6,7,8,9,
+        3,4,5,6,7,8,9,10,
+        4,5,6,7,8,9,10,11,
+        5,6,7,8,9,10,11,12
+    };
+
+    tinyml::Tensor<float> Q(queue,{M,K});
+    tinyml::Tensor<float> K_tensor(queue,{N,K});
+    tinyml::Tensor<float> V(queue,{N,K});
+    tinyml::Tensor<float> U(queue,{M,K});
+
+    auto e1=ops::copy_to_device(queue,Q,h_Q.data());
+    auto e2=ops::copy_to_device(queue,K_tensor,h_K.data());
+    auto e3=ops::copy_to_device(queue,V,h_V.data());
+
+    auto e4=ops::attention_scores_online(queue,Q.data(),K_tensor.data(),V.data(),U.data(),M,K,N,tile_size,{e1,e2,e3});
+
+    std::vector<float> h_U(M*K);
+    ops::copy_to_host(queue,h_U.data(),U,{e4}).wait_and_throw();
+
+    // CPU reference
+
+    std::vector<double> scores(M*N,0.0);
+    std::vector<double> weights(M*N,0.0);
+    std::vector<double> reference(M*K,0.0);
+
+    const double scale=1.0/std::sqrt(static_cast<double>(K));
+
+    for(std::size_t i=0;i<M;i++){
+        for(std::size_t j=0;j<N;j++){
+            for(std::size_t k=0;k<K;k++){
+                scores[i*N+j]+=static_cast<double>(h_Q[i*K+k])*static_cast<double>(h_K[j*K+k]);
+            }
+            scores[i*N+j]*=scale;
+        }
+    }
+
+    for(std::size_t i=0;i<M;i++){
+        double row_max=scores[i*N];
+
+        for(std::size_t j=1;j<N;j++){
+            row_max=std::max(row_max,scores[i*N+j]);
+        }
+
+        double row_sum=0.0;
+
+        for(std::size_t j=0;j<N;j++){
+            weights[i*N+j]=std::exp(scores[i*N+j]-row_max);
+            row_sum+=weights[i*N+j];
+        }
+
+        for(std::size_t j=0;j<N;j++){
+            weights[i*N+j]/=row_sum;
+        }
+    }
+
+    for(std::size_t i=0;i<M;i++){
+        for(std::size_t k=0;k<K;k++){
+            for(std::size_t j=0;j<N;j++){
+                reference[i*K+k]+=weights[i*N+j]*static_cast<double>(h_V[j*K+k]);
+            }
+        }
+    }
+
+    // Compare
+
+    double max_diff=0.0;
+    bool finite_results=true;
+
+    std::cout << "Fused GPU output:\n";
+
+    for(std::size_t i=0;i<M;i++){
+        for(std::size_t k=0;k<K;k++){
+            std::cout << h_U[i*K+k] << " ";
+
+            if(!std::isfinite(h_U[i*K+k])){
+                finite_results=false;
+            }
+            else{
+                max_diff=std::max(max_diff,std::abs(static_cast<double>(h_U[i*K+k])-reference[i*K+k]));
+            }
+        }
+        std::cout << "\n";
+    }
+
+    std::cout << "CPU reference:\n";
+
+    for(std::size_t i=0;i<M;i++){
+        for(std::size_t k=0;k<K;k++){
+            std::cout << reference[i*K+k] << " ";
+        }
+        std::cout << "\n";
+    }
+
+    std::cout << "Maximum difference: " << max_diff << "\n";
+
+    if(finite_results && max_diff<1e-5){
+        std::cout << "Fused Online Attention test PASSED\n";
+    }
+    else{
+        std::cout << "Fused Online Attention test FAILED\n";
+        all_tests_passed=false;
+    }
+}
+
+{
+    std::cout << "\n=== Fused Online Attention Large Test ===\n";
+
+    const std::size_t M=127, N=259, K=128;
+    const std::size_t tile_size=16;
+
+    std::vector<float> h_Q(M*K);
+    std::vector<float> h_K(N*K);
+    std::vector<float> h_V(N*K);
+
+    // Deterministic bounded input data
+    for(std::size_t i=0;i<M*K;i++){
+        h_Q[i]=static_cast<float>(static_cast<int>(i%17)-8)/8.0f;
+    }
+
+    for(std::size_t i=0;i<N*K;i++){
+        h_K[i]=static_cast<float>(static_cast<int>(i%13)-6)/6.0f;
+        h_V[i]=static_cast<float>(static_cast<int>(i%19)-9)/9.0f;
+    }
+
+    tinyml::Tensor<float> Q(queue,{M,K});
+    tinyml::Tensor<float> K_tensor(queue,{N,K});
+    tinyml::Tensor<float> V(queue,{N,K});
+    tinyml::Tensor<float> U(queue,{M,K});
+
+    auto e1=ops::copy_to_device(queue,Q,h_Q.data());
+    auto e2=ops::copy_to_device(queue,K_tensor,h_K.data());
+    auto e3=ops::copy_to_device(queue,V,h_V.data());
+
+    auto e4=ops::attention_scores_online(queue,Q.data(),K_tensor.data(),V.data(),U.data(),M,K,N,tile_size,{e1,e2,e3});
+
+    std::vector<float> h_U(M*K);
+    ops::copy_to_host(queue,h_U.data(),U,{e4}).wait_and_throw();
+
+    // CPU reference
+    std::vector<double> scores(M*N,0.0);
+    std::vector<double> weights(M*N,0.0);
+    std::vector<double> reference(M*K,0.0);
+
+    const double scale=1.0/std::sqrt(static_cast<double>(K));
+
+    for(std::size_t i=0;i<M;i++){
+        for(std::size_t j=0;j<N;j++){
+            for(std::size_t k=0;k<K;k++){
+                scores[i*N+j]+=static_cast<double>(h_Q[i*K+k])*static_cast<double>(h_K[j*K+k]);
+            }
+            scores[i*N+j]*=scale;
+        }
+    }
+
+    for(std::size_t i=0;i<M;i++){
+        double row_max=scores[i*N];
+
+        for(std::size_t j=1;j<N;j++){
+            row_max=std::max(row_max,scores[i*N+j]);
+        }
+
+        double row_sum=0.0;
+
+        for(std::size_t j=0;j<N;j++){
+            weights[i*N+j]=std::exp(scores[i*N+j]-row_max);
+            row_sum+=weights[i*N+j];
+        }
+
+        for(std::size_t j=0;j<N;j++){
+            weights[i*N+j]/=row_sum;
+        }
+    }
+
+    for(std::size_t i=0;i<M;i++){
+        for(std::size_t k=0;k<K;k++){
+            for(std::size_t j=0;j<N;j++){
+                reference[i*K+k]+=weights[i*N+j]*static_cast<double>(h_V[j*K+k]);
+            }
+        }
+    }
+
+    // Compare
+    double max_diff=0.0;
+    double mean_diff=0.0;
+    std::size_t finite_count=0;
+    std::size_t non_finite=0;
+
+    for(std::size_t i=0;i<M*K;i++){
+        if(!std::isfinite(h_U[i])){
+            if(non_finite<10){
+                std::cout << "Non-finite U[" << i << "] = " << h_U[i] << "\n";
+            }
+            non_finite++;
+        }
+        else{
+            double diff=std::abs(static_cast<double>(h_U[i])-reference[i]);
+            max_diff=std::max(max_diff,diff);
+            mean_diff+=diff;
+            finite_count++;
+        }
+    }
+
+    if(finite_count>0){
+        mean_diff/=static_cast<double>(finite_count);
+    }
+
+    std::cout << "M=" << M << ", N=" << N << ", K=" << K << ", tile=" << tile_size << "\n";
+    std::cout << "Maximum difference: " << max_diff << "\n";
+    std::cout << "Mean difference:    " << mean_diff << "\n";
+    std::cout << "Non-finite results: " << non_finite << "\n";
+
+    if(non_finite==0 && max_diff<1e-4){
+        std::cout << "Fused Online Attention Large test PASSED\n";
+    }
+    else{
+        std::cout << "Fused Online Attention Large test FAILED\n";
+        all_tests_passed=false;
+    }
+}
+    {
+        std::cout << "\n=== Attention Performance Benchmark ===\n";
+
+        const std::size_t M=127, N=259, K=128;
+        const std::size_t tile_size=16;
+        const std::size_t group_size=16;
+        const std::size_t warmup=10;
+        const std::size_t iterations=100;
+
+        std::vector<float> h_Q(M*K);
+        std::vector<float> h_K(N*K);
+        std::vector<float> h_V(N*K);
+
+        for(std::size_t i=0;i<M*K;i++){
+            h_Q[i]=static_cast<float>(static_cast<int>(i%17)-8)/8.0f;
+        }
+
+        for(std::size_t i=0;i<N*K;i++){
+            h_K[i]=static_cast<float>(static_cast<int>(i%13)-6)/6.0f;
+            h_V[i]=static_cast<float>(static_cast<int>(i%19)-9)/9.0f;
+        }
+
+        tinyml::Tensor<float> Q(queue,{M,K});
+        tinyml::Tensor<float> K_tensor(queue,{N,K});
+        tinyml::Tensor<float> V(queue,{N,K});
+
+        tinyml::Tensor<float> scores(queue,{M,N});
+        tinyml::Tensor<float> weights(queue,{M,N});
+        tinyml::Tensor<float> output_unfused(queue,{M,K});
+        tinyml::Tensor<float> output_fused(queue,{M,K});
+
+        auto e1=ops::copy_to_device(queue,Q,h_Q.data());
+        auto e2=ops::copy_to_device(queue,K_tensor,h_K.data());
+        auto e3=ops::copy_to_device(queue,V,h_V.data());
+
+        e1.wait();
+        e2.wait();
+        e3.wait();
+
+        // Warm-up unfused
+        for(std::size_t i=0;i<warmup;i++){
+            auto u1=ops::matmul_tiled_transposed_scaled(queue,Q,K_tensor,scores,tile_size);
+            auto u2=ops::softmax_parallel(queue,scores,weights,group_size,{u1});
+            auto u3=ops::matmul_tiled(queue,weights,V,output_unfused,tile_size,{u2});
+            u3.wait();
+        }
+
+        // Warm-up fused
+        for(std::size_t i=0;i<warmup;i++){
+            auto f=ops::attention_scores_online(queue,Q,K_tensor,V,output_fused,tile_size);
+            f.wait();
+        }
+
+        double qk_time=0.0;
+        double softmax_time=0.0;
+        double sv_time=0.0;
+        double fused_time=0.0;
+
+        // Benchmark unfused
+        for(std::size_t i=0;i<iterations;i++){
+            auto u1=ops::matmul_tiled_transposed_scaled(queue,Q,K_tensor,scores,tile_size);
+            auto u2=ops::softmax_parallel(queue,scores,weights,group_size,{u1});
+            auto u3=ops::matmul_tiled(queue,weights,V,output_unfused,tile_size,{u2});
+
+            u3.wait();
+
+            auto qk_start=u1.get_profiling_info<sycl::info::event_profiling::command_start>();
+            auto qk_end=u1.get_profiling_info<sycl::info::event_profiling::command_end>();
+
+            auto sm_start=u2.get_profiling_info<sycl::info::event_profiling::command_start>();
+            auto sm_end=u2.get_profiling_info<sycl::info::event_profiling::command_end>();
+
+            auto sv_start=u3.get_profiling_info<sycl::info::event_profiling::command_start>();
+            auto sv_end=u3.get_profiling_info<sycl::info::event_profiling::command_end>();
+
+            qk_time+=static_cast<double>(qk_end-qk_start);
+            softmax_time+=static_cast<double>(sm_end-sm_start);
+            sv_time+=static_cast<double>(sv_end-sv_start);
+        }
+
+        // Benchmark fused
+        for(std::size_t i=0;i<iterations;i++){
+            auto f=ops::attention_scores_online(queue,Q,K_tensor,V,output_fused,tile_size);
+
+            f.wait();
+
+            auto start=f.get_profiling_info<sycl::info::event_profiling::command_start>();
+            auto end=f.get_profiling_info<sycl::info::event_profiling::command_end>();
+
+            fused_time+=static_cast<double>(end-start);
+        }
+
+        // Profiling timestamps are in nanoseconds
+        qk_time/=iterations*1.0e6;
+        softmax_time/=iterations*1.0e6;
+        sv_time/=iterations*1.0e6;
+        fused_time/=iterations*1.0e6;
+
+        double unfused_time=qk_time+softmax_time+sv_time;
+
+        std::cout << "M=" << M << ", N=" << N << ", K=" << K << ", tile=" << tile_size << "\n";
+        std::cout << "Iterations: " << iterations << "\n\n";
+
+        std::cout << "Unfused:\n";
+        std::cout << "  QK^T + scale: " << qk_time << " ms\n";
+        std::cout << "  Softmax:      " << softmax_time << " ms\n";
+        std::cout << "  S*V:          " << sv_time << " ms\n";
+        std::cout << "  Total:        " << unfused_time << " ms\n\n";
+
+        std::cout << "Fused:\n";
+        std::cout << "  Total:        " << fused_time << " ms\n\n";
+
+        std::cout << "Unfused / Fused: " << unfused_time/fused_time << "x\n";
+    }
+    
+    {
+        std::cout << "\n=== Attention Scaling Benchmark ===\n";
+    
+        const std::vector<std::size_t> sizes={128,256,512,1024,2048};
+        const std::size_t K=128;
+        const std::size_t tile_size=16;
+        const std::size_t group_size=16;
+        const std::size_t warmup=5;
+        const std::size_t iterations=50;
+    
+        std::cout << "K=" << K << ", tile=" << tile_size << "\n";
+        std::cout << "Iterations=" << iterations << "\n\n";
+    
+        std::cout << "Size\tUnfused(ms)\tFused(ms)\tUnfused/Fused\n";
+    
+        for(std::size_t size:sizes){
+            const std::size_t M=size;
+            const std::size_t N=size;
+    
+            std::vector<float> h_Q(M*K);
+            std::vector<float> h_K(N*K);
+            std::vector<float> h_V(N*K);
+    
+            for(std::size_t i=0;i<M*K;i++){
+                h_Q[i]=static_cast<float>(static_cast<int>(i%17)-8)/8.0f;
+            }
+    
+            for(std::size_t i=0;i<N*K;i++){
+                h_K[i]=static_cast<float>(static_cast<int>(i%13)-6)/6.0f;
+                h_V[i]=static_cast<float>(static_cast<int>(i%19)-9)/9.0f;
+            }
+    
+            tinyml::Tensor<float> Q(queue,{M,K});
+            tinyml::Tensor<float> K_tensor(queue,{N,K});
+            tinyml::Tensor<float> V(queue,{N,K});
+    
+            tinyml::Tensor<float> scores(queue,{M,N});
+            tinyml::Tensor<float> weights(queue,{M,N});
+            tinyml::Tensor<float> output_unfused(queue,{M,K});
+            tinyml::Tensor<float> output_fused(queue,{M,K});
+    
+            auto e1=ops::copy_to_device(queue,Q,h_Q.data());
+            auto e2=ops::copy_to_device(queue,K_tensor,h_K.data());
+            auto e3=ops::copy_to_device(queue,V,h_V.data());
+    
+            e1.wait();
+            e2.wait();
+            e3.wait();
+    
+            // Warm-up unfused
+            for(std::size_t i=0;i<warmup;i++){
+                auto u1=ops::matmul_tiled_transposed_scaled(queue,Q,K_tensor,scores,tile_size);
+                auto u2=ops::softmax_parallel(queue,scores,weights,group_size,{u1});
+                auto u3=ops::matmul_tiled(queue,weights,V,output_unfused,tile_size,{u2});
+                u3.wait();
+            }
+    
+            // Warm-up fused
+            for(std::size_t i=0;i<warmup;i++){
+                auto f=ops::attention_scores_online(queue,Q,K_tensor,V,output_fused,tile_size);
+                f.wait();
+            }
+    
+            double unfused_time=0.0;
+            double fused_time=0.0;
+    
+            // Unfused benchmark
+            for(std::size_t i=0;i<iterations;i++){
+                auto u1=ops::matmul_tiled_transposed_scaled(queue,Q,K_tensor,scores,tile_size);
+                auto u2=ops::softmax_parallel(queue,scores,weights,group_size,{u1});
+                auto u3=ops::matmul_tiled(queue,weights,V,output_unfused,tile_size,{u2});
+    
+                u3.wait();
+    
+                auto qk_start=u1.get_profiling_info<sycl::info::event_profiling::command_start>();
+                auto qk_end=u1.get_profiling_info<sycl::info::event_profiling::command_end>();
+    
+                auto sm_start=u2.get_profiling_info<sycl::info::event_profiling::command_start>();
+                auto sm_end=u2.get_profiling_info<sycl::info::event_profiling::command_end>();
+    
+                auto sv_start=u3.get_profiling_info<sycl::info::event_profiling::command_start>();
+                auto sv_end=u3.get_profiling_info<sycl::info::event_profiling::command_end>();
+    
+                unfused_time+=static_cast<double>(qk_end-qk_start);
+                unfused_time+=static_cast<double>(sm_end-sm_start);
+                unfused_time+=static_cast<double>(sv_end-sv_start);
+            }
+    
+            // Fused benchmark
+            for(std::size_t i=0;i<iterations;i++){
+                auto f=ops::attention_scores_online(queue,Q,K_tensor,V,output_fused,tile_size);
+    
+                f.wait();
+    
+                auto start=f.get_profiling_info<sycl::info::event_profiling::command_start>();
+                auto end=f.get_profiling_info<sycl::info::event_profiling::command_end>();
+    
+                fused_time+=static_cast<double>(end-start);
+            }
+    
+            unfused_time/=static_cast<double>(iterations)*1.0e6;
+            fused_time/=static_cast<double>(iterations)*1.0e6;
+    
+            std::cout << size << "\t"
+                      << unfused_time << "\t\t"
+                      << fused_time << "\t\t"
+                      << unfused_time/fused_time << "\n";
+        }
+    }
+    {
+        std::cout << "\n=== Attention Large Scaling Benchmark ===\n";
+    
+        const std::vector<std::size_t> sizes={1024,2048,3072,4096,6144,8192};
+        const std::size_t K=128;
+        const std::size_t tile_size=16;
+        const std::size_t group_size=16;
+    
+        std::cout << "K=" << K << ", tile=" << tile_size << "\n\n";
+        std::cout << "Size\tIterations\tUnfused(ms)\tFused(ms)\tUnfused/Fused\n";
+    
+        for(std::size_t size:sizes){
+            const std::size_t M=size;
+            const std::size_t N=size;
+    
+            std::size_t iterations;
+            if(size<=2048) iterations=30;
+            else if(size<=4096) iterations=15;
+            else iterations=5;
+    
+            const std::size_t warmup=3;
+    
+            std::vector<float> h_Q(M*K);
+            std::vector<float> h_K(N*K);
+            std::vector<float> h_V(N*K);
+    
+            for(std::size_t i=0;i<M*K;i++){
+                h_Q[i]=static_cast<float>(static_cast<int>(i%17)-8)/8.0f;
+            }
+    
+            for(std::size_t i=0;i<N*K;i++){
+                h_K[i]=static_cast<float>(static_cast<int>(i%13)-6)/6.0f;
+                h_V[i]=static_cast<float>(static_cast<int>(i%19)-9)/9.0f;
+            }
+    
+            tinyml::Tensor<float> Q(queue,{M,K});
+            tinyml::Tensor<float> K_tensor(queue,{N,K});
+            tinyml::Tensor<float> V(queue,{N,K});
+    
+            tinyml::Tensor<float> scores(queue,{M,N});
+            tinyml::Tensor<float> weights(queue,{M,N});
+            tinyml::Tensor<float> output_unfused(queue,{M,K});
+            tinyml::Tensor<float> output_fused(queue,{M,K});
+    
+            auto e1=ops::copy_to_device(queue,Q,h_Q.data());
+            auto e2=ops::copy_to_device(queue,K_tensor,h_K.data());
+            auto e3=ops::copy_to_device(queue,V,h_V.data());
+    
+            e1.wait();
+            e2.wait();
+            e3.wait();
+    
+            // Warm-up unfused
+            for(std::size_t i=0;i<warmup;i++){
+                auto u1=ops::matmul_tiled_transposed_scaled(queue,Q,K_tensor,scores,tile_size);
+                auto u2=ops::softmax_parallel(queue,scores,weights,group_size,{u1});
+                auto u3=ops::matmul_tiled(queue,weights,V,output_unfused,tile_size,{u2});
+                u3.wait();
+            }
+    
+            // Warm-up fused
+            for(std::size_t i=0;i<warmup;i++){
+                auto f=ops::attention_scores_online(queue,Q,K_tensor,V,output_fused,tile_size);
+                f.wait();
+            }
+    
+            double unfused_time=0.0;
+            double fused_time=0.0;
+    
+            for(std::size_t i=0;i<iterations;i++){
+                auto u1=ops::matmul_tiled_transposed_scaled(queue,Q,K_tensor,scores,tile_size);
+                auto u2=ops::softmax_parallel(queue,scores,weights,group_size,{u1});
+                auto u3=ops::matmul_tiled(queue,weights,V,output_unfused,tile_size,{u2});
+    
+                u3.wait();
+    
+                auto qk_start=u1.get_profiling_info<sycl::info::event_profiling::command_start>();
+                auto qk_end=u1.get_profiling_info<sycl::info::event_profiling::command_end>();
+    
+                auto sm_start=u2.get_profiling_info<sycl::info::event_profiling::command_start>();
+                auto sm_end=u2.get_profiling_info<sycl::info::event_profiling::command_end>();
+    
+                auto sv_start=u3.get_profiling_info<sycl::info::event_profiling::command_start>();
+                auto sv_end=u3.get_profiling_info<sycl::info::event_profiling::command_end>();
+    
+                unfused_time+=static_cast<double>(qk_end-qk_start);
+                unfused_time+=static_cast<double>(sm_end-sm_start);
+                unfused_time+=static_cast<double>(sv_end-sv_start);
+            }
+    
+            for(std::size_t i=0;i<iterations;i++){
+                auto f=ops::attention_scores_online(queue,Q,K_tensor,V,output_fused,tile_size);
+    
+                f.wait();
+    
+                auto start=f.get_profiling_info<sycl::info::event_profiling::command_start>();
+                auto end=f.get_profiling_info<sycl::info::event_profiling::command_end>();
+    
+                fused_time+=static_cast<double>(end-start);
+            }
+    
+            unfused_time/=static_cast<double>(iterations)*1.0e6;
+            fused_time/=static_cast<double>(iterations)*1.0e6;
+    
+            std::cout << size << "\t"
+                      << iterations << "\t\t"
+                      << unfused_time << "\t\t"
+                      << fused_time << "\t\t"
+                      << unfused_time/fused_time << "\n";
+        }
+    }
+
+    test_attention_max_size(queue);
     // =========================================================
     // Final test summary
     // =========================================================

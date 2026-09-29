@@ -10,7 +10,176 @@
 
 constexpr float eps = 1.0e-5f;
 namespace ops{
+
+
+    template <typename T>
+    sycl::event attention_scores_online(sycl::queue& queue, T *Q, T *K, T *V, T *U, std::size_t M, std::size_t K_dim, std::size_t N, std::size_t tile_size, const std::vector<sycl::event>& dependencies={}){  
+        std::size_t global_rows = ((M + tile_size - 1) / tile_size) * tile_size;
+        std::size_t global_cols = tile_size;
     
+        return queue.submit([&](sycl::handler& h) {
+            sycl::local_accessor<T, 2> local_A(sycl::range<2>(tile_size, tile_size+1), h);
+            sycl::local_accessor<T, 2> local_B(sycl::range<2>(tile_size, tile_size+1), h);
+            sycl::local_accessor<T, 2> local_S(sycl::range<2>(tile_size, tile_size), h);
+            sycl::local_accessor<T, 2> local_max(sycl::range<2>(tile_size,tile_size), h);
+            sycl::local_accessor<T, 2> local_sum(sycl::range<2>(tile_size, tile_size), h);
+            sycl::local_accessor<T, 1> running_max(sycl::range<1>(tile_size), h);
+            sycl::local_accessor<T, 1> running_sum(sycl::range<1>(tile_size), h);
+            sycl::local_accessor<T, 2> local_V(sycl::range<2>(tile_size, tile_size), h);
+            h.depends_on(dependencies);
+    
+            h.parallel_for(sycl::nd_range<2>(sycl::range<2>(global_rows, global_cols),sycl::range<2>(tile_size, tile_size)), [=](sycl::nd_item<2> item)
+            {
+                std::size_t row = item.get_global_id(0);
+                // std::size_t col = item.get_global_id(1);
+    
+                std::size_t local_row = item.get_local_id(0);
+                std::size_t local_col = item.get_local_id(1);
+    
+                
+                if(local_col==0){
+                    running_max[local_row]=std::numeric_limits<T>::lowest();
+                    running_sum[local_row]=static_cast<T>(0);
+                }
+                for(std::size_t k_tile=0; k_tile<K_dim; k_tile+=tile_size){
+                    std::size_t u_col=k_tile+local_col;
+                    if(row<M && u_col<K_dim){
+                        U[row*K_dim+u_col]=static_cast<T>(0);
+                    }
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for(std::size_t j_tile=0; j_tile<N; j_tile+=tile_size){
+                    std::size_t col = j_tile+local_col;
+                    std::size_t b_row = col - local_col + local_row;
+                    
+                    T local_cij=static_cast<T>(0);    
+                    for (std::size_t tile_start=0; tile_start<K_dim; tile_start+=tile_size)
+                    {
+                        if(row<M && (tile_start+local_col)<K_dim){
+                        local_A[local_row][local_col]=Q[row*K_dim+(tile_start+local_col)];
+                        }
+                        else{
+                            local_A[local_row][local_col]=static_cast<T>(0);
+                        }
+        
+                        if(b_row<N && (tile_start+local_col)<K_dim){
+                            local_B[local_row][local_col]=K[b_row*K_dim+(tile_start+local_col)];
+                        }
+                        else{
+                            local_B[local_row][local_col]=static_cast<T>(0);
+                        }
+        
+                        item.barrier(sycl::access::fence_space::local_space);
+        
+                        for(std::size_t k=0; k<tile_size; k++){
+                            local_cij+=local_A[local_row][k]*local_B[local_col][k];
+                        }
+        
+                        item.barrier(sycl::access::fence_space::local_space);
+                    }
+                    T local_score=local_cij/sycl::sqrt(static_cast<T>(K_dim));
+                    if(row<M && col<N){
+                        local_max[local_row][local_col]=local_score;
+                    }
+                    else{
+                        local_max[local_row][local_col]=std::numeric_limits<T>::lowest();
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    // local_max[local_row][local_col]=local_C[local_row][local_col];
+                    // item.barrier(sycl::access::fence_space::local_space);
+                    for(std::size_t j=tile_size/2; j>0; j>>=1){
+                        if(local_col<j){
+                            local_max[local_row][local_col]=(local_max[local_row][local_col]>local_max[local_row][local_col+j]?local_max[local_row][local_col]:local_max[local_row][local_col+j]);
+                        }
+                        item.barrier(sycl::access::fence_space::local_space);
+                    }
+                    //running_max[local_row]=local_max[local_row][0];
+                    if(row<M && col<N){
+                        local_S[local_row][local_col]=sycl::exp(local_score-local_max[local_row][0]);
+                    }
+                    else{
+                        local_S[local_row][local_col]=static_cast<T>(0);
+                    }
+                    local_sum[local_row][local_col]=local_S[local_row][local_col];
+                    item.barrier(sycl::access::fence_space::local_space);
+                    for(std::size_t j=tile_size/2; j>0; j>>=1){
+                        if(local_col<j){
+                            local_sum[local_row][local_col]+=local_sum[local_row][local_col+j];
+                        }
+                        item.barrier(sycl::access::fence_space::local_space);
+                    }
+                    T m_tile=local_max[local_row][0];
+                    T m_old= running_max[local_row];
+                    T m_new= (m_tile>m_old?m_tile:m_old);
+                    T d_old=running_sum[local_row];
+                    T d_tile=local_sum[local_row][0];
+                    T scale_old=sycl::exp(m_old-m_new);
+                    T scale_tile=sycl::exp(m_tile-m_new);
+                    T d_new=d_old*scale_old+d_tile*scale_tile;
+                    if(local_col==0){
+                        running_max[local_row]=m_new;
+                        running_sum[local_row]=d_new;
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                    for(std::size_t k_tile=0; k_tile<K_dim; k_tile+=tile_size){
+                        std::size_t v_col=k_tile+local_col;
+                    
+                        if(b_row<N && v_col<K_dim){
+                            local_V[local_row][local_col]=V[b_row*K_dim+v_col];
+                        }
+                        else{
+                            local_V[local_row][local_col]=static_cast<T>(0);
+                        }
+                    
+                        item.barrier(sycl::access::fence_space::local_space);
+                    
+                        // next: local_S × local_V for this output tile
+                        T local_u=static_cast<T>(0);
+
+                        for(std::size_t j=0; j<tile_size; j++){
+                            local_u+=local_S[local_row][j]*local_V[j][local_col];
+                        }                      
+                        std::size_t u_col=k_tile+local_col;
+                        if(row<M && u_col<K_dim){
+                            U[row*K_dim+u_col]=U[row*K_dim+u_col]*scale_old+local_u*scale_tile;
+                        }
+                        item.barrier(sycl::access::fence_space::local_space);
+                    }
+                }
+                for(std::size_t k_tile=0; k_tile<K_dim; k_tile+=tile_size){
+                    std::size_t u_col=k_tile+local_col;
+                    if(row<M && u_col<K_dim){
+                        U[row*K_dim+u_col]/=running_sum[local_row];
+                    }
+                }
+            });
+        });
+        
+    }
+ 
+    template <typename T>
+    sycl::event attention_scores_online(sycl::queue& queue, tinyml::Tensor<T>& Q, tinyml::Tensor<T>& K, tinyml::Tensor<T>& V, tinyml::Tensor<T>& U, std::size_t tile_size, const std::vector<sycl::event>& dependencies={})
+    {
+        if(Q.shape().size()!=2 || K.shape().size()!=2 || V.shape().size()!=2 || U.shape().size()!=2 ||
+        Q.shape()[0]==0 || Q.shape()[1]==0 || K.shape()[0]==0 ||
+        Q.shape()[1]!=K.shape()[1] ||
+        K.shape()!=V.shape() ||
+        U.shape()!=Q.shape()){
+            throw std::invalid_argument("attention_scores_online: tensor shapes must match");
+        }
+
+        if(tile_size==0 || (tile_size & (tile_size-1))!=0){
+            throw std::invalid_argument("attention_scores_online: tile_size must be a power of 2");
+        }
+
+        std::size_t M=Q.shape()[0];
+        std::size_t K_dim=Q.shape()[1];
+        std::size_t N=K.shape()[0];
+
+        return attention_scores_online(queue,Q.data(),K.data(),V.data(),U.data(),M,K_dim,N,tile_size,dependencies);
+    }
 
     template <typename T>
     sycl::event matmul_tiled_transposed_scaled(sycl::queue& queue,T *a, T *b, T *c,std::size_t M,std::size_t K,std::size_t N, std::size_t tile_size, const std::vector<sycl::event>& dependencies={})
@@ -308,7 +477,7 @@ namespace ops{
     sycl::event layer_norm(sycl::queue& queue, tinyml::Tensor<T>& input, tinyml::Tensor<T>& output, std::size_t group_size, const std::vector<sycl::event>& dependencies={}){
         
         if (input.shape().size() != 2 || output.shape().size() != 2 || input.shape() != output.shape() ||  input.shape()[0] == 0 || input.shape()[1] == 0) {
-            throw std::invalid_argument("softmax: tensors must be 2D, non-empty, and have matching shapes");
+            throw std::invalid_argument("layer_norm: tensors must be 2D, non-empty, and have matching shapes");
         }
         if (group_size == 0) {
             throw std::invalid_argument("layer_norm: group_size must be larger than");
