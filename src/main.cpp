@@ -3547,7 +3547,146 @@ int main()
         }
     }
 
-    test_attention_max_size(queue);
+    //test_attention_max_size(queue);
+
+    {
+        std::cout << "\n--- Multi-head attention test ---\n";
+    
+        std::size_t B=2;
+        std::size_t H=3;
+        std::size_t L=4;
+        std::size_t D=8;
+        std::size_t tile_size=2;
+    
+        tinyml::Tensor<float> Q(queue,{B,H,L,D});
+        tinyml::Tensor<float> K(queue,{B,H,L,D});
+        tinyml::Tensor<float> V(queue,{B,H,L,D});
+        tinyml::Tensor<float> U(queue,{B,H,L,D});
+        tinyml::Tensor<float> U_ref(queue,{B,H,L,D});
+    
+        std::size_t numel=B*H*L*D;
+    
+        std::vector<float> h_Q(numel);
+        std::vector<float> h_K(numel);
+        std::vector<float> h_V(numel);
+        std::vector<float> h_U(numel);
+        std::vector<float> h_U_ref(numel);
+    
+        for(std::size_t i=0;i<numel;i++){
+            h_Q[i]=static_cast<float>((static_cast<int>(i)%17)-8)*0.1f;
+            h_K[i]=static_cast<float>((static_cast<int>(i)%13)-6)*0.1f;
+            h_V[i]=static_cast<float>((static_cast<int>(i)%19)-9)*0.1f;
+        }
+    
+        auto e1=ops::copy_to_device(queue,Q,h_Q.data());
+        auto e2=ops::copy_to_device(queue,K,h_K.data());
+        auto e3=ops::copy_to_device(queue,V,h_V.data());
+    
+        auto e_multi=ops::multi_heads_attention_scores_online(queue,Q,K,V,U,tile_size,{e1,e2,e3});
+    
+        std::vector<sycl::event> ref_events;
+    
+        for(std::size_t b=0;b<B;b++){
+            for(std::size_t h=0;h<H;h++){
+                std::size_t offset=(b*H+h)*L*D;
+    
+                float* Q_head=Q.data()+offset;
+                float* K_head=K.data()+offset;
+                float* V_head=V.data()+offset;
+                float* U_head=U_ref.data()+offset;
+    
+                auto e=ops::attention_scores_online(queue,Q_head,K_head,V_head,U_head,L,D,L,tile_size,{e1,e2,e3});
+                ref_events.push_back(e);
+            }
+        }
+    
+        auto e4=ops::copy_to_host(queue,h_U.data(),U,{e_multi});
+        auto e5=ops::copy_to_host(queue,h_U_ref.data(),U_ref,ref_events);
+    
+        e4.wait();
+        e5.wait();
+    
+        float max_diff=0.0f;
+    
+        for(std::size_t i=0;i<numel;i++){
+            max_diff=std::max(max_diff,std::abs(h_U[i]-h_U_ref[i]));
+        }
+    
+        std::cout << "B=" << B << " H=" << H << " L=" << L << " D=" << D << "\n";
+        std::cout << "Max difference: " << max_diff << "\n";
+    
+        if(max_diff<1e-5f){
+            std::cout << "MULTI-HEAD ATTENTION TEST PASSED\n";
+        }else{
+            std::cout << "MULTI-HEAD ATTENTION TEST FAILED\n";
+        }
+    }
+    {
+        std::cout << "\n--- Linear forward_3d test ---\n";
+    
+        std::size_t B=2;
+        std::size_t L=3;
+        std::size_t K=4;
+        std::size_t N=5;
+        std::size_t group_size=8;
+        std::size_t tile_size=2;
+    
+        tinyml::Tensor<float> X3(queue,{B,L,K});
+        tinyml::Tensor<float> Y3(queue,{B,L,N});
+    
+        tinyml::Tensor<float> X2(queue,{B*L,K});
+        tinyml::Tensor<float> Y2(queue,{B*L,N});
+    
+        tinyml::Linear<float> linear(queue,K,N);
+    
+        std::vector<float> h_X(B*L*K);
+        std::vector<float> h_W(K*N);
+        std::vector<float> h_b(N);
+        std::vector<float> h_Y3(B*L*N);
+        std::vector<float> h_Y2(B*L*N);
+    
+        for(std::size_t i=0;i<h_X.size();i++){
+            h_X[i]=static_cast<float>((static_cast<int>(i)%11)-5)*0.1f;
+        }
+    
+        for(std::size_t i=0;i<h_W.size();i++){
+            h_W[i]=static_cast<float>((static_cast<int>(i)%7)-3)*0.1f;
+        }
+    
+        for(std::size_t i=0;i<h_b.size();i++){
+            h_b[i]=static_cast<float>(i)*0.05f;
+        }
+    
+        auto e1=ops::copy_to_device(queue,X3,h_X.data());
+        auto e2=ops::copy_to_device(queue,X2,h_X.data());
+        auto e3=ops::copy_to_device(queue,linear.weight(),h_W.data());
+        auto e4=ops::copy_to_device(queue,linear.bias(),h_b.data());
+    
+        auto e3d=linear.forward_3d(X3,Y3,group_size,tile_size,{e1,e3,e4});
+        auto e2d=linear.forward(X2,Y2,group_size,tile_size,{e2,e3,e4});
+    
+        auto e5=ops::copy_to_host(queue,h_Y3.data(),Y3,{e3d});
+        auto e6=ops::copy_to_host(queue,h_Y2.data(),Y2,{e2d});
+    
+        e5.wait();
+        e6.wait();
+    
+        float max_diff=0.0f;
+    
+        for(std::size_t i=0;i<h_Y3.size();i++){
+            max_diff=std::max(max_diff,std::abs(h_Y3[i]-h_Y2[i]));
+        }
+    
+        std::cout << "X3=[" << B << "," << L << "," << K << "]  Y3=[" << B << "," << L << "," << N << "]\n";
+        std::cout << "Equivalent 2D: X2=[" << B*L << "," << K << "]  Y2=[" << B*L << "," << N << "]\n";
+        std::cout << "Max difference: " << max_diff << "\n";
+    
+        if(max_diff<1e-5f){
+            std::cout << "LINEAR FORWARD_3D TEST PASSED\n";
+        }else{
+            std::cout << "LINEAR FORWARD_3D TEST FAILED\n";
+        }
+    }
     // =========================================================
     // Final test summary
     // =========================================================

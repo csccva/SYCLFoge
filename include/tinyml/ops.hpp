@@ -182,6 +182,38 @@ namespace ops{
     }
 
     template <typename T>
+    sycl::event multi_heads_attention_scores_online(sycl::queue& queue, tinyml::Tensor<T>& Q, tinyml::Tensor<T>& K, tinyml::Tensor<T>& V, tinyml::Tensor<T>& U, std::size_t tile_size, const std::vector<sycl::event>& dependencies={})
+    {
+        if(Q.shape().size()!=4 || K.shape().size()!=4 || V.shape().size()!=4 || U.shape().size()!=4 || Q.shape()[0]==0 || Q.shape()[1]==0 || Q.shape()[2]==0 || Q.shape()[3]==0 || K.shape()!=Q.shape() || V.shape()!=Q.shape() || U.shape()!=Q.shape()){
+            throw std::invalid_argument("multi_head_attention_scores_online: tensor shapes must match");
+        }
+
+        if(tile_size==0 || (tile_size & (tile_size-1))!=0){
+            throw std::invalid_argument("attention_scores_online: tile_size must be a power of 2");
+        }
+        std::size_t batch=Q.shape()[0];
+        std::size_t nheads=Q.shape()[1];
+        std::size_t M=Q.shape()[2];
+        std::size_t K_dim=Q.shape()[3];
+        std::size_t N=K.shape()[2];
+        std::vector<sycl::event> l_deps;
+        for(std::size_t i_b=0;i_b<batch;i_b++){        
+            for(std::size_t i_h=0;i_h<nheads; i_h++){
+                std::size_t offset=(i_b*nheads+i_h)*M*K_dim;
+                T* Q_head=Q.data()+offset;
+                T* K_head=K.data()+offset;
+                T* V_head=V.data()+offset;
+                T* U_head=U.data()+offset;
+                sycl::event e=attention_scores_online(queue,Q_head,K_head,V_head,U_head,M,K_dim,N,tile_size,dependencies);
+                l_deps.push_back(e);
+            }
+        }
+        return queue.submit([&](sycl::handler& h){
+            h.depends_on(l_deps);
+        });
+    }
+
+    template <typename T>
     sycl::event matmul_tiled_transposed_scaled(sycl::queue& queue,T *a, T *b, T *c,std::size_t M,std::size_t K,std::size_t N, std::size_t tile_size, const std::vector<sycl::event>& dependencies={})
     {
         std::size_t global_rows = ((M + tile_size - 1) / tile_size) * tile_size;
