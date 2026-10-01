@@ -18,10 +18,11 @@ The development path is roughly:
 4. Matrix multiplication
 5. Neural-network layers
 6. Small feed-forward networks
-7. Transformer building blocks
-8. Attention
-9. Transformer model
-10. Tiny LLM inference
+7. Attention
+8. Multi-head attention
+9. Transformer building blocks
+10. Transformer model
+11. Tiny LLM inference
 
 The initial focus is inference. The design may later be extended toward gradients and training.
 
@@ -76,6 +77,8 @@ Current operations include:
 - tiled multiplication with a transposed second operand
 - scaled tiled multiplication with a transposed second operand
 - fused scaled dot-product attention using online softmax
+- multi-head attention
+- strided multi-head attention over `[B,L,d_model]` tensors
 
 Operations return `sycl::event` objects so dependencies between asynchronous GPU operations can be expressed explicitly.
 
@@ -130,6 +133,20 @@ where:
 - `Y` has shape `[batch_size, out_features]`
 
 The matrix multiplication and bias kernels are connected through SYCL event dependencies.
+
+The linear layer also supports 3D Transformer-style tensors:
+
+```text
+X [B,L,in_features]
+        |
+        v
+Linear
+        |
+        v
+Y [B,L,out_features]
+```
+
+The `[B,L,in_features]` tensor is interpreted as a contiguous `[B*L,in_features]` matrix during matrix multiplication, so no physical reshape or data movement is required.
 
 ### Activation functions
 
@@ -289,6 +306,84 @@ The implementation is inspired by the online-softmax/blockwise approach used by 
 
 In particular, the current implementation updates the running output accumulator through global device memory. A more optimized implementation would keep output fragments in per-thread private/register storage while streaming K/V blocks.
 
+### Multi-head attention
+
+Multi-head attention is implemented using the fused online-softmax attention kernel.
+
+An initial implementation operates on tensors where the heads have already been physically separated:
+
+```text
+[B,H,L,d_head]
+```
+
+This implementation is retained as a useful reference.
+
+A second implementation operates directly on Transformer-style projected tensors:
+
+```text
+Q [B,L,d_model]
+K [B,L,d_model]
+V [B,L,d_model]
+```
+
+The model dimension is divided into attention heads:
+
+\[
+d_{\mathrm{head}} = \frac{d_{\mathrm{model}}}{H}
+\]
+
+where `H` is the number of heads.
+
+Logically, the feature dimension is interpreted as:
+
+```text
+d_model
+
+| head 0 | head 1 | head 2 | ... |
+```
+
+Rather than physically rearranging the tensors into `[B,H,L,d_head]`, the strided attention kernel accesses each head directly inside the original `[B,L,d_model]` memory layout.
+
+For head `h`, the starting feature offset is:
+
+```text
+j_start = h * d_head
+```
+
+The attention kernel then uses the full `d_model` row stride while operating only on the `d_head` features belonging to that head.
+
+For each batch and head, the effective operation is therefore:
+
+```text
+Q[b,:,head] [L,d_head]
+K[b,:,head] [L,d_head]
+V[b,:,head] [L,d_head]
+             |
+             v
+      fused attention
+             |
+             v
+U[b,:,head] [L,d_head]
+```
+
+while the physical tensors remain:
+
+```text
+[B,L,d_model]
+```
+
+This avoids an intermediate physical transpose or rearrangement from `[B,L,d_model]` to `[B,H,L,d_head]`.
+
+The implementation launches attention independently for each `(batch, head)` pair. The resulting SYCL events are collected and joined into a single completion event.
+
+The implementation has been tested at several levels:
+
+- the strided single-head kernel against the contiguous single-head implementation
+- the multi-head strided wrapper against individual head calls
+- the batched multi-head strided implementation against explicit per-batch, per-head execution
+
+The current batched correctness test uses `B=4`, `L=4`, `d_model=8`, and two attention heads and produces identical output to the explicit reference execution.
+
 ### Attention memory scaling
 
 The unfused and fused implementations have also been tested with increasing sequence lengths.
@@ -371,11 +466,15 @@ Run with:
 
 The next major steps are:
 
-- multi-head attention
+- Q/K/V projections using 3D linear layers
+- attention output projection
+- residual connections and layer normalization
+- Transformer feed-forward network
+- Transformer block
 - embeddings
-- transformer blocks
 - token and weight loading
 - tiny Transformer inference
+- autoregressive generation
 - further GPU kernel optimization
 
 Attention optimization can later explore:
@@ -387,18 +486,69 @@ Attention optimization can later explore:
 
 A parallel learning path is to implement the attention algorithm in Triton and compare its block and register programming model with the SYCL implementation.
 
+After the SYCL implementation is sufficiently complete, portability to another SYCL implementation such as AdaptiveCpp can also be explored.
+
 Longer term, the project may explore automatic differentiation and training.
 
 ## Status
 
 Work in progress.
 
-The project currently supports an end-to-end GPU inference pipeline composed from tensors, custom SYCL kernels, linear layers, activation functions, softmax, layer normalization, feed-forward networks, and single-head scaled dot-product attention.
+The project currently provides the main low-level GPU operations needed to begin constructing a Transformer inference pipeline.
 
-Both unfused and fused attention implementations are now available. The unfused implementation composes tiled \(QK^T/\sqrt{d_k}\), parallel softmax, and tiled multiplication with `V`. The fused implementation uses blockwise processing and online softmax to avoid materializing the full attention score and weight matrices.
+Implemented components include:
 
-The fused kernel has been validated against the unfused implementation and used to explore the difference between conventional attention's quadratic intermediate-memory requirements and blockwise attention.
+- USM-based device memory management
+- multidimensional tensor storage
+- host/device transfers
+- elementwise tensor operations
+- naïve and tiled matrix multiplication
+- linear layers
+- 3D linear layers for `[B,L,D]` tensors
+- ReLU and GELU
+- serial and parallel softmax
+- serial and parallel layer normalization
+- feed-forward neural-network composition
+- unfused scaled dot-product attention
+- fused attention using blockwise online softmax
+- multi-head attention
+- strided batched multi-head attention operating directly on `[B,L,d_model]`
 
-The next major development stage is multi-head attention, followed by the remaining components required for a small Transformer inference pipeline.
+The current Transformer-oriented data path is:
 
-This is an educational project for exploring C++, SYCL, GPU programming, GPU memory-access patterns, parallel reductions, kernel fusion, online softmax, and the internals of machine-learning frameworks. The kernels are intentionally implemented directly rather than delegating the work to optimized ML or BLAS libraries.
+```text
+X [B,L,d_model]
+        |
+        | Linear projections
+        v
+Q,K,V [B,L,d_model]
+        |
+        | strided multi-head attention
+        v
+Attention output [B,L,d_model]
+```
+
+The 3D linear layer and the batched strided attention path have both been implemented and tested independently. The next step is to connect them into a single end-to-end attention pipeline.
+
+The strided attention implementation logically divides the model dimension into heads without physically rearranging the projected tensors into `[B,H,L,d_head]`. Each attention kernel operates directly on its feature slice using the original `d_model` memory stride.
+
+The fused attention kernel uses blockwise processing and online softmax to avoid materializing the complete attention score and softmax-weight matrices. It has been validated numerically against the unfused implementation and used to explore the difference between quadratic intermediate storage and blockwise attention.
+
+The batched strided multi-head implementation has been validated against explicit per-batch, per-head execution, with identical results in the current correctness test.
+
+The next development step is to connect three `Linear::forward_3d()` projections for Q, K, and V directly to the batched strided multi-head attention implementation:
+
+```text
+                 ┌─ Linear W_Q ──> Q ─┐
+                 │                     │
+X [B,L,D] ───────├─ Linear W_K ──> K ─┼─> Multi-head attention
+                 │                     │           |
+                 └─ Linear W_V ──> V ─┘           v
+                                             [B,L,D]
+```
+
+This will form the core attention path required for the first Transformer block.
+
+After that, the remaining major components are the attention output projection, residual connections, layer normalization, feed-forward network integration, embeddings, model-weight loading, and autoregressive inference.
+
+This is an educational project for exploring C++, SYCL, GPU programming, GPU memory-access patterns, parallel reductions, kernel fusion, online softmax, multi-head attention, and the internals of machine-learning frameworks. The kernels are intentionally implemented directly rather than delegating the work to optimized ML or BLAS libraries.
