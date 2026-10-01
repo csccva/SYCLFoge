@@ -93,25 +93,21 @@ Several matrix multiplication operations are currently available:
 
 The transposed operation computes:
 
-\[
-C = AB^T
-\]
+**C = AB^T**
 
 for:
 
-- `A` with shape `[M, K]`
-- `B` with shape `[N, K]`
-- `C` with shape `[M, N]`
+- `A` with shape `[M,K]`
+- `B` with shape `[N,K]`
+- `C` with shape `[M,N]`
 
 This avoids explicitly constructing a transposed copy of `B`.
 
 A scaled version computes:
 
-\[
-C = \frac{AB^T}{\sqrt{K}}
-\]
+**C = AB^T / sqrt(K)**
 
-which provides the score computation required by scaled dot-product attention when `A = Q`, `B = K`, and the matrix dimension `K` corresponds to the attention dimension \(d_k\).
+which provides the score computation required by scaled dot-product attention when `A = Q`, `B = K`, and the matrix dimension `K` corresponds to the attention dimension `d_k`.
 
 The tiled implementations use SYCL local memory to reuse matrix data within work-groups. Local-memory padding is used in the transposed implementation to reduce unfavorable strided bank-access patterns.
 
@@ -121,16 +117,14 @@ The matrix multiplication kernels are intended primarily for learning GPU optimi
 
 A basic fully connected layer is implemented:
 
-\[
-Y = XW + b
-\]
+**Y = XW + b**
 
 where:
 
-- `X` has shape `[batch_size, in_features]`
-- `W` has shape `[in_features, out_features]`
+- `X` has shape `[batch_size,in_features]`
+- `W` has shape `[in_features,out_features]`
 - `b` has shape `[out_features]`
-- `Y` has shape `[batch_size, out_features]`
+- `Y` has shape `[batch_size,out_features]`
 
 The matrix multiplication and bias kernels are connected through SYCL event dependencies.
 
@@ -154,9 +148,7 @@ ReLU and GELU activation functions are implemented as SYCL GPU kernels.
 
 ReLU:
 
-\[
-\mathrm{ReLU}(x) = \max(0,x)
-\]
+**ReLU(x) = max(0,x)**
 
 Two GELU implementations are available:
 
@@ -165,27 +157,11 @@ Two GELU implementations are available:
 
 The exact formulation is:
 
-\[
-\mathrm{GELU}(x) =
-\frac{x}{2}
-\left(
-1 + \mathrm{erf}\left(\frac{x}{\sqrt{2}}\right)
-\right)
-\]
+**GELU(x) = x / 2 * (1 + erf(x / sqrt(2)))**
 
 The approximate formulation is:
 
-\[
-\mathrm{GELU}(x) \approx
-\frac{x}{2}
-\left[
-1 +
-\tanh\left(
-\sqrt{\frac{2}{\pi}}
-\left(x + 0.044715x^3\right)
-\right)
-\right]
-\]
+**GELU(x) ≈ x / 2 * [1 + tanh(sqrt(2 / pi) * (x + 0.044715x^3))]**
 
 Both implementations have been tested against CPU references. The exact and approximate implementations have also been compared for numerical accuracy and GPU execution time using SYCL event profiling.
 
@@ -208,19 +184,19 @@ The parallel implementation uses SYCL work-group reductions to compute row stati
 The implemented components can be composed into a small neural-network inference pipeline:
 
 ```text
-X [batch, 2]
+X [batch,2]
     |
     v
-Linear(2, 4)
+Linear(2,4)
     |
     v
 ReLU / GELU
     |
     v
-Linear(4, 2)
+Linear(4,2)
     |
     v
-Y [batch, 2]
+Y [batch,2]
 ```
 
 The neural-network operations are executed on the GPU, with input data and parameters explicitly transferred to device memory.
@@ -233,22 +209,15 @@ Single-head scaled dot-product attention is implemented and tested.
 
 The operation is:
 
-\[
-\mathrm{Attention}(Q,K,V)
-=
-\mathrm{softmax}
-\left(
-\frac{QK^T}{\sqrt{d_k}}
-\right)V
-\]
+**Attention(Q,K,V) = softmax(QK^T / sqrt(d_k)) V**
 
 The initial implementation composes three existing GPU operations:
 
 ```text
 Q ──┐
-    ├── QK^T / sqrt(dk) ──> scores ──> softmax ──> weights ──┐
-K ──┘                                                        ├──> output
-V ───────────────────────────────────────────────────────────┘
+    ├── QK^T / sqrt(d_k) ──> scores ──> softmax ──> weights ──┐
+K ──┘                                                         ├──> output
+V ────────────────────────────────────────────────────────────┘
 ```
 
 The scaled score calculation uses the tiled transposed matrix-multiplication kernel, so an explicit transposed copy of `K` is not required.
@@ -265,25 +234,17 @@ Instead of materializing the complete score and softmax-weight matrices, the ker
 
 For each query row, the kernel maintains:
 
-- a running maximum \(m\)
-- a running softmax denominator \(D\)
-- a running unnormalized output \(U\)
+- a running maximum `m`
+- a running softmax denominator `D`
+- a running unnormalized output `U`
 
-For a new score tile with maximum \(m_{\mathrm{tile}}\), the running maximum becomes:
+For a new score tile with maximum `m_tile`, the running maximum becomes:
 
-\[
-m_{\mathrm{new}} = \max(m_{\mathrm{old}},m_{\mathrm{tile}})
-\]
+**m_new = max(m_old,m_tile)**
 
 and the denominator is updated using:
 
-\[
-D_{\mathrm{new}}
-=
-D_{\mathrm{old}}e^{m_{\mathrm{old}}-m_{\mathrm{new}}}
-+
-D_{\mathrm{tile}}e^{m_{\mathrm{tile}}-m_{\mathrm{new}}}
-\]
+**D_new = D_old * exp(m_old - m_new) + D_tile * exp(m_tile - m_new)**
 
 The output numerator is rescaled in the same way while accumulating the contribution from the corresponding `V` tile.
 
@@ -292,13 +253,13 @@ After all key/value tiles have been processed, the accumulated output is normali
 This allows attention to be evaluated without storing the full:
 
 ```text
-scores  [M, N]
-weights [M, N]
+scores  [M,N]
+weights [M,N]
 ```
 
 intermediate tensors.
 
-For fixed attention dimension \(d_k\), this changes the intermediate-memory behavior from quadratic in sequence length to a blockwise streaming approach.
+For fixed attention dimension `d_k`, this changes the intermediate-memory behavior from quadratic in sequence length to a blockwise streaming approach.
 
 The fused implementation has been validated numerically against the unfused attention implementation over multiple K/V tiles. For one larger correctness test with `M=127`, `N=259`, and `K=128`, the maximum difference between the implementations was approximately `6.2e-9`.
 
@@ -328,9 +289,7 @@ V [B,L,d_model]
 
 The model dimension is divided into attention heads:
 
-\[
-d_{\mathrm{head}} = \frac{d_{\mathrm{model}}}{H}
-\]
+**d_head = d_model / H**
 
 where `H` is the number of heads.
 
@@ -374,7 +333,7 @@ while the physical tensors remain:
 
 This avoids an intermediate physical transpose or rearrangement from `[B,L,d_model]` to `[B,H,L,d_head]`.
 
-The implementation launches attention independently for each `(batch, head)` pair. The resulting SYCL events are collected and joined into a single completion event.
+The implementation launches attention independently for each `(batch,head)` pair. The resulting SYCL events are collected and joined into a single completion event.
 
 The implementation has been tested at several levels:
 
@@ -390,15 +349,14 @@ The unfused and fused implementations have also been tested with increasing sequ
 
 For square attention with `M=N`, the unfused implementation requires two large intermediate matrices:
 
-\[
-\mathrm{scores},\mathrm{weights} \in \mathbb{R}^{N\times N}
-\]
+```text
+scores  [N,N]
+weights [N,N]
+```
 
 For FP32, these two matrices alone require:
 
-\[
-8N^2 \text{ bytes}
-\]
+**8N^2 bytes**
 
 The unfused implementation successfully ran at `N=32768`, where the score and weight matrices together require approximately 8 GiB.
 
@@ -466,16 +424,20 @@ Run with:
 
 The next major steps are:
 
+- causal attention masking
 - Q/K/V projections using 3D linear layers
 - attention output projection
 - residual connections and layer normalization
 - Transformer feed-forward network
 - Transformer block
-- embeddings
-- token and weight loading
-- tiny Transformer inference
+- token and positional embeddings
+- tokenization integration
+- GPT-2 weight loading
+- GPT-2 Small inference
 - autoregressive generation
 - further GPU kernel optimization
+
+The first complete pretrained model target is GPT-2 Small.
 
 Attention optimization can later explore:
 
@@ -536,19 +498,50 @@ The fused attention kernel uses blockwise processing and online softmax to avoid
 
 The batched strided multi-head implementation has been validated against explicit per-batch, per-head execution, with identical results in the current correctness test.
 
-The next development step is to connect three `Linear::forward_3d()` projections for Q, K, and V directly to the batched strided multi-head attention implementation:
+The next development steps toward GPT-2 are:
 
 ```text
-                 ┌─ Linear W_Q ──> Q ─┐
-                 │                     │
-X [B,L,D] ───────├─ Linear W_K ──> K ─┼─> Multi-head attention
-                 │                     │           |
-                 └─ Linear W_V ──> V ─┘           v
-                                             [B,L,D]
+Token IDs
+    |
+    v
+Token + positional embedding
+    |
+    v
+X [B,L,d_model]
+    |
+    v
+LayerNorm
+    |
+    ├── Linear W_Q ──> Q ─┐
+    ├── Linear W_K ──> K ─┼──> causal multi-head attention
+    └── Linear W_V ──> V ─┘
+                           |
+                           v
+                    Linear W_O
+                           |
+                           v
+                     Residual add
+                           |
+                           v
+                      LayerNorm
+                           |
+                           v
+                 Linear d_model -> d_ff
+                           |
+                           v
+                         GELU
+                           |
+                           v
+                 Linear d_ff -> d_model
+                           |
+                           v
+                     Residual add
 ```
 
-This will form the core attention path required for the first Transformer block.
+The immediate attention-specific requirement for GPT-2 is causal masking, so that a token at position `i` cannot attend to future positions.
 
-After that, the remaining major components are the attention output projection, residual connections, layer normalization, feed-forward network integration, embeddings, model-weight loading, and autoregressive inference.
+After the Transformer block is assembled, the remaining major components are token and positional embeddings, pretrained GPT-2 weight loading, tokenizer integration, the final language-model head, and autoregressive generation.
 
-This is an educational project for exploring C++, SYCL, GPU programming, GPU memory-access patterns, parallel reductions, kernel fusion, online softmax, multi-head attention, and the internals of machine-learning frameworks. The kernels are intentionally implemented directly rather than delegating the work to optimized ML or BLAS libraries.
+The tokenizer will be provided by an existing implementation rather than reimplemented as part of this project. The embedding operation and Transformer inference path will be implemented in the project.
+
+This is an educational project for exploring C++, SYCL, GPU programming, GPU memory-access patterns, parallel reductions, kernel fusion, online softmax, multi-head attention, Transformer inference, and the internals of machine-learning frameworks. The kernels are intentionally implemented directly rather than delegating the work to optimized ML or BLAS libraries.
