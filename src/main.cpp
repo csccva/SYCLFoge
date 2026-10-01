@@ -3687,6 +3687,86 @@ int main()
             std::cout << "LINEAR FORWARD_3D TEST FAILED\n";
         }
     }
+
+    {
+        std::cout << "\n--- Batched multi-head strided attention test ---\n";
+    
+        using T=float;
+    
+        std::size_t B=4;
+        std::size_t L=4;
+        std::size_t d_model=8;
+        std::size_t nheads=2;
+        std::size_t d_head=d_model/nheads;
+        std::size_t tile_size=2;
+    
+        tinyml::Tensor<T> Q(queue,{B,L,d_model});
+        tinyml::Tensor<T> K(queue,{B,L,d_model});
+        tinyml::Tensor<T> V(queue,{B,L,d_model});
+        tinyml::Tensor<T> U_multi(queue,{B,L,d_model});
+        tinyml::Tensor<T> U_ref(queue,{B,L,d_model});
+    
+        std::size_t total_size=B*L*d_model;
+    
+        std::vector<T> h_Q(total_size);
+        std::vector<T> h_K(total_size);
+        std::vector<T> h_V(total_size);
+        std::vector<T> h_U_multi(total_size);
+        std::vector<T> h_U_ref(total_size);
+    
+        for(std::size_t i=0;i<total_size;i++){
+            h_Q[i]=static_cast<T>(static_cast<int>(i%13)-6)*0.1f;
+            h_K[i]=static_cast<T>(static_cast<int>(i%11)-5)*0.07f;
+            h_V[i]=static_cast<T>(static_cast<int>(i%17)-8)*0.05f;
+        }
+    
+        auto e1=ops::copy_to_device(queue,Q,h_Q.data());
+        auto e2=ops::copy_to_device(queue,K,h_K.data());
+        auto e3=ops::copy_to_device(queue,V,h_V.data());
+    
+        auto e_multi=ops::multi_heads_attention_scores_online_strided(queue,Q,K,V,U_multi,nheads,tile_size,{e1,e2,e3});
+    
+        std::vector<sycl::event> ref_events;
+    
+        for(std::size_t b=0;b<B;b++){
+            std::size_t offset=b*L*d_model;
+    
+            for(std::size_t h=0;h<nheads;h++){
+                std::size_t j_start=h*d_head;
+    
+                auto e=ops::attention_scores_online_strided(queue,Q.data()+offset,K.data()+offset,V.data()+offset,U_ref.data()+offset,L,d_head,L,j_start,d_model,tile_size,{e1,e2,e3});
+    
+                ref_events.push_back(e);
+            }
+        }
+    
+        auto e4=ops::copy_to_host(queue,h_U_multi.data(),U_multi,{e_multi});
+        auto e5=ops::copy_to_host(queue,h_U_ref.data(),U_ref,ref_events);
+    
+        e4.wait();
+        e5.wait();
+    
+        T max_diff=static_cast<T>(0);
+    
+        for(std::size_t i=0;i<total_size;i++){
+            T diff=sycl::fabs(h_U_multi[i]-h_U_ref[i]);
+    
+            if(diff>max_diff){
+                max_diff=diff;
+            }
+        }
+    
+        std::cout << "B=" << B << " L=" << L << " d_model=" << d_model << " nheads=" << nheads << " d_head=" << d_head << "\n";
+        std::cout << "Max difference: " << max_diff << "\n";
+    
+        if(max_diff<1.0e-5f){
+            std::cout << "BATCHED MULTI-HEAD STRIDED ATTENTION TEST PASSED\n";
+        }
+        else{
+            std::cout << "BATCHED MULTI-HEAD STRIDED ATTENTION TEST FAILED\n";
+        }
+    }
+
     // =========================================================
     // Final test summary
     // =========================================================
