@@ -17,18 +17,18 @@ The development path is roughly:
 3. Basic tensor operations
 4. Matrix multiplication
 5. Neural-network layers
-6. Small feed-forward networks
-7. Attention
+6. Feed-forward networks
+7. Scaled dot-product attention
 8. Multi-head attention
-9. Transformer building blocks
-10. Transformer model
-11. Tiny LLM inference
+9. Causal Transformer attention
+10. Transformer block
+11. Token and positional embeddings
+12. GPT-2 Small inference
+13. Autoregressive generation
 
 The initial focus is inference. The design may later be extended toward gradients and training.
 
 ## Current functionality
-
-
 
 ### Device memory
 
@@ -40,8 +40,6 @@ It handles:
 - device memory ownership
 - automatic deallocation
 - prevention of accidental shallow copies
-
-
 
 ### Tensor
 
@@ -55,7 +53,7 @@ It handles:
 For example:
 
 ```cpp
-tinyml::Tensor<float> X(queue, {32, 128});
+tinyml::Tensor<float> X(queue,{32,128});
 ```
 
 creates a tensor representing 32 samples with 128 features each.
@@ -76,6 +74,7 @@ Current operations include:
 - approximate GELU
 - serial and parallel softmax
 - serial and parallel layer normalization
+- affine parallel layer normalization
 - matrix multiplication
 - tiled matrix multiplication
 - tiled multiplication with a transposed second operand
@@ -83,10 +82,11 @@ Current operations include:
 - fused scaled dot-product attention using online softmax
 - multi-head attention
 - strided multi-head attention over `[B,L,d_model]` tensors
+- causal strided multi-head attention
 
 Operations return `sycl::event` objects so dependencies between asynchronous GPU operations can be expressed explicitly.
 
-### Matrix multiplication
+## Matrix multiplication
 
 Several matrix multiplication operations are currently available:
 
@@ -117,7 +117,7 @@ The tiled implementations use SYCL local memory to reuse matrix data within work
 
 The matrix multiplication kernels are intended primarily for learning GPU optimization techniques. They are not intended to replace optimized BLAS implementations.
 
-### Linear layer
+## Linear layer
 
 A basic fully connected layer is implemented:
 
@@ -138,7 +138,7 @@ The linear layer also supports 3D Transformer-style tensors:
 X [B,L,in_features]
         |
         v
-Linear
+      Linear
         |
         v
 Y [B,L,out_features]
@@ -146,7 +146,7 @@ Y [B,L,out_features]
 
 The `[B,L,in_features]` tensor is interpreted as a contiguous `[B*L,in_features]` matrix during matrix multiplication, so no physical reshape or data movement is required.
 
-### Activation functions
+## Activation functions
 
 ReLU and GELU activation functions are implemented as SYCL GPU kernels.
 
@@ -169,7 +169,7 @@ The approximate formulation is:
 
 Both implementations have been tested against CPU references. The exact and approximate implementations have also been compared for numerical accuracy and GPU execution time using SYCL event profiling.
 
-### Softmax
+## Softmax
 
 Both serial and parallel GPU implementations of softmax are available.
 
@@ -177,7 +177,7 @@ The parallel implementation uses work-group reductions to compute the normalizat
 
 The parallel softmax is used by the unfused scaled dot-product attention implementation. A separate online-softmax formulation is used by the fused attention kernel.
 
-### Layer normalization
+## Layer normalization
 
 Both serial and parallel implementations of layer normalization are available.
 
@@ -189,31 +189,33 @@ The affine parallel implementation is used for the pre-LayerNorm structure of th
 
 The implementation is primarily intended for learning parallel reduction techniques and floating-point behavior on GPUs.
 
-### Feed-forward network
+## Feed-forward networks
 
-The implemented components can be composed into a small neural-network inference pipeline:
+The implemented operations can be composed into simple feed-forward neural networks using `Linear`, activation functions, and explicit SYCL event dependencies.
+
+A GPT-2-style Transformer feed-forward path is also implemented:
 
 ```text
-X [batch,2]
-    |
-    v
-Linear(2,4)
-    |
-    v
-ReLU / GELU
-    |
-    v
-Linear(4,2)
-    |
-    v
-Y [batch,2]
+X [B,L,768]
+        |
+        v
+Linear 768 -> 3072
+        |
+        v
+      GELU
+        |
+        v
+Linear 3072 -> 768
+        |
+        v
+Y [B,L,768]
 ```
 
-The neural-network operations are executed on the GPU, with input data and parameters explicitly transferred to device memory.
+The output can then be combined with the residual input using the elementwise addition operation.
 
-Dependencies between parameter transfers and successive operations are expressed using `sycl::event` objects, allowing kernels to be chained without requiring host synchronization between layers.
+This path has been tested independently at GPT-2 Small dimensions.
 
-### Scaled dot-product attention
+## Scaled dot-product attention
 
 Single-head scaled dot-product attention is implemented and tested.
 
@@ -236,27 +238,7 @@ The resulting score matrix is normalized using the parallel softmax kernel and t
 
 This implementation provides a simple reference for exploring attention before kernel fusion.
 
-### GPT-2 feed-forward network
-
-The GPT-2-style Transformer feed-forward path has been implemented using the existing 3D linear layer and GELU operation:
-
-```text
-X [B,L,768]
-        |
-        v
-Linear 768 -> 3072
-        |
-        v
-      GELU
-        |
-        v
-Linear 3072 -> 768
-        |
-        v
-Y [B,L,768]
-```
-
-### Fused attention with online softmax
+## Fused attention with online softmax
 
 A fused attention implementation has also been developed.
 
@@ -297,7 +279,7 @@ The implementation is inspired by the online-softmax/blockwise approach used by 
 
 In particular, the current implementation updates the running output accumulator through global device memory. A more optimized implementation would keep output fragments in per-thread private/register storage while streaming K/V blocks.
 
-### Multi-head attention
+## Multi-head attention
 
 Multi-head attention is implemented using the fused online-softmax attention kernel.
 
@@ -367,13 +349,13 @@ The implementation launches attention independently for each `(batch,head)` pair
 
 The implementation has been tested at several levels:
 
-- the strided single-head kernel against the contiguous single-head implementation
-- the multi-head strided wrapper against individual head calls
-- the batched multi-head strided implementation against explicit per-batch, per-head execution
+- multi-head attention using the explicit `[B,H,L,d_head]` representation
+- strided attention operating directly on `[B,L,d_model]`
+- batched strided multi-head attention
+- causal strided attention
+- batched causal strided multi-head attention
 
-The current batched correctness test uses `B=4`, `L=4`, `d_model=8`, and two attention heads and produces identical output to the explicit reference execution.
-
-### Causal multi-head attention
+## Causal multi-head attention
 
 A separate causal version of the strided fused attention kernel is implemented for autoregressive Transformer inference.
 
@@ -387,7 +369,54 @@ The causal implementation operates directly on projected `[B,L,d_model]` tensors
 
 The causal path has been tested for individual heads and for batched multi-head attention. It has also been integrated with learned Q/K/V projections and tested at GPT-2 Small dimensions with `d_model=768` and `12` attention heads.
 
-### Attention memory scaling
+## GPT-2 attention path
+
+The individual components of the GPT-2 attention sublayer have been integrated into a single correctness test.
+
+The tested data path is:
+
+```text
+X [B,L,d_model]
+        |
+        v
+   LayerNorm 1
+        |
+        v
+   Q / K / V
+   projections
+        |
+        v
+causal multi-head
+    attention
+        |
+        v
+       W_O
+        |
+        v
+   residual + X
+        |
+        v
+        R
+        |
+        v
+   LayerNorm 2
+```
+
+The integration test uses GPT-2 Small dimensions:
+
+```text
+B       = 2
+L       = 128
+d_model = 768
+heads   = 12
+d_head  = 64
+```
+
+The GPU results are compared against CPU reference calculations for LayerNorm, attention, output projection, and the residual path.
+
+The second LayerNorm is validated using the actual GPU residual as its CPU-reference input so that the LayerNorm kernel is tested independently from numerical differences accumulated by the preceding attention path.
+
+## Attention memory scaling
 
 The unfused and fused implementations have also been tested with increasing sequence lengths.
 
@@ -411,6 +440,39 @@ The fused implementation, which does not allocate these quadratic intermediates,
 These tests demonstrate the different memory-scaling behavior of the two approaches. They should not be interpreted as representative performance measurements of dedicated GPU hardware.
 
 Current development and benchmarking are performed on an Intel integrated GPU that also drives the operating-system display, so performance measurements can be affected by other GPU activity and shared-memory behavior.
+
+## Tests and benchmarks
+
+Correctness tests are separated from the main executable and organized by component:
+
+```text
+tests/
+├── test_core.cpp
+├── test_nn.cpp
+├── test_sdpa.cpp
+├── test_attention.cpp
+└── benchmark_ops.cpp
+```
+
+The test executables are grouped by purpose:
+
+- `test_core.cpp` — basic tensor operations and matrix multiplication
+- `test_nn.cpp` — activations, softmax, LayerNorm, Linear, and feed-forward/MLP operations
+- `test_sdpa.cpp` — scaled dot-product attention and fused online-softmax attention
+- `test_attention.cpp` — multi-head, strided, causal, and GPT-2 attention-path integration tests
+
+Performance experiments are kept separately in `benchmark_ops.cpp`.
+
+Current benchmarks include:
+
+- exact versus approximate GELU
+- tiled matrix multiplication
+- fused versus unfused attention
+- attention scaling with sequence length
+
+A separate attention maximum-size experiment is also available for exploring the different memory behavior of fused and unfused attention.
+
+Keeping correctness tests and performance experiments separate allows the normal executable to remain minimal while individual components can be tested or benchmarked independently.
 
 ## Design principles
 
@@ -444,6 +506,11 @@ tinyml/
 │   └── main.cpp
 ├── examples/
 ├── tests/
+│   ├── test_core.cpp
+│   ├── test_nn.cpp
+│   ├── test_sdpa.cpp
+│   ├── test_attention.cpp
+│   └── benchmark_ops.cpp
 └── build/
 ```
 
@@ -453,33 +520,119 @@ A SYCL-capable C++ compiler is required.
 
 The project is currently developed using Intel oneAPI `icpx`.
 
-```bash
-cmake -S . -B build -DCMAKE_CXX_COMPILER=icpx
-cmake --build build
-```
-
-Run with:
+Configure the project with tests enabled:
 
 ```bash
-./build/tinyml
+cmake -S . -B build \
+  -DCMAKE_CXX_COMPILER=icpx \
+  -DTINYML_BUILD_TESTS=ON
 ```
+
+Build the main executable:
+
+```bash
+cmake --build build --target tinyml
+```
+
+Build the correctness tests:
+
+```bash
+cmake --build build --target test_core test_nn test_sdpa test_attention
+```
+
+Build the benchmarks:
+
+```bash
+cmake --build build --target benchmark_ops
+```
+
+The individual executables can then be run directly, for example:
+
+```bash
+./build/test_core
+./build/test_nn
+./build/test_sdpa
+./build/test_attention
+./build/benchmark_ops
+```
+
+The normal `tinyml` executable is intentionally minimal while the framework is under development.
+
+## GPT-2 Small target
+
+The first complete pretrained model target is GPT-2 Small.
+
+The target architecture uses:
+
+```text
+vocabulary size = 50257
+context length  = 1024
+d_model         = 768
+attention heads = 12
+d_head          = 64
+Transformer layers = 12
+feed-forward dimension = 3072
+```
+
+The intended Transformer block is a pre-LayerNorm architecture:
+
+```text
+X
+|
+v
+LayerNorm 1
+|
+v
+Q/K/V projections
+|
+v
+causal multi-head attention
+|
+v
+output projection
+|
+v
+residual add
+|
+v
+R
+|
+v
+LayerNorm 2
+|
+v
+Linear 768 -> 3072
+|
+v
+GELU
+|
+v
+Linear 3072 -> 768
+|
+v
+residual add
+|
+v
+Output
+```
+
+All of the computational operations required by this block have now been implemented and tested independently. The next step is to encapsulate this data path in a reusable Transformer block abstraction.
 
 ## Roadmap
 
 The next major steps are:
 
 - Transformer block abstraction
-- token and positional embeddings
+- dedicated Transformer block correctness test
+- token embeddings
+- learned positional embeddings
 - final layer normalization
 - GPT-2 weight loading
 - language-model head with tied token-embedding weights
 - tokenization integration
 - GPT-2 Small inference
 - autoregressive generation
-- test reorganization and optional test builds
 - further GPU kernel optimization
-
-The first complete pretrained model target is GPT-2 Small.
 
 Attention optimization can later explore:
 
@@ -498,7 +651,7 @@ Longer term, the project may explore automatic differentiation and training.
 
 Work in progress.
 
-The project now contains the main computational components required for a GPT-2 Transformer block.
+The project now contains the computational components required for a GPT-2 Transformer block.
 
 Implemented components include:
 
@@ -521,46 +674,10 @@ Implemented components include:
 - attention output projection
 - Transformer residual connections
 - GPT-2-style feed-forward network
+- first and second pre-LayerNorm stages
+- component-level and integrated attention-path correctness tests
+- separate correctness-test and benchmark executables
 
-The current Transformer block data path is:
+The current development boundary is the Transformer block abstraction: the underlying operations are implemented and independently validated, but they have not yet been packaged into a reusable Transformer block class.
 
-```text
-X [B,L,d_model]
-        |
-        v
-   LayerNorm 1
-        |
-        v
-   Q/K/V projections
-        |
-        v
-causal multi-head attention
-        |
-        v
-       W_O
-        |
-        v
-   residual + X
-        |
-        v
-        R
-        |
-        v
-   LayerNorm 2
-        |
-        v
-Linear d_model -> 4*d_model
-        |
-        v
-      GELU
-        |
-        v
-Linear 4*d_model -> d_model
-        |
-        v
-   residual + R
-        |
-        v
-      Output
-```
-
+The next implementation step is therefore to combine the existing components into that abstraction before moving on to embeddings and full GPT-2 inference.
