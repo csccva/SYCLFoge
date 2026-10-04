@@ -28,6 +28,8 @@ The initial focus is inference. The design may later be extended toward gradient
 
 ## Current functionality
 
+
+
 ### Device memory
 
 `DeviceBuffer<T>` provides basic RAII-based management of SYCL USM device memory.
@@ -38,6 +40,8 @@ It handles:
 - device memory ownership
 - automatic deallocation
 - prevention of accidental shallow copies
+
+
 
 ### Tensor
 
@@ -177,7 +181,13 @@ The parallel softmax is used by the unfused scaled dot-product attention impleme
 
 Both serial and parallel implementations of layer normalization are available.
 
-The parallel implementation uses SYCL work-group reductions to compute row statistics. The implementation is primarily intended for learning parallel reduction techniques and floating-point behavior on GPUs.
+The parallel implementation uses SYCL work-group reductions to compute row statistics and supports learned affine parameters:
+
+**Y = gamma * (X - mean) / sqrt(variance + eps) + beta**
+
+The affine parallel implementation is used for the pre-LayerNorm structure of the GPT-2 Transformer block.
+
+The implementation is primarily intended for learning parallel reduction techniques and floating-point behavior on GPUs.
 
 ### Feed-forward network
 
@@ -225,6 +235,25 @@ The scaled score calculation uses the tiled transposed matrix-multiplication ker
 The resulting score matrix is normalized using the parallel softmax kernel and then multiplied by `V` using tiled matrix multiplication.
 
 This implementation provides a simple reference for exploring attention before kernel fusion.
+
+### GPT-2 feed-forward network
+
+The GPT-2-style Transformer feed-forward path has been implemented using the existing 3D linear layer and GELU operation:
+
+```text
+X [B,L,768]
+        |
+        v
+Linear 768 -> 3072
+        |
+        v
+      GELU
+        |
+        v
+Linear 3072 -> 768
+        |
+        v
+Y [B,L,768]
 
 ### Fused attention with online softmax
 
@@ -343,6 +372,20 @@ The implementation has been tested at several levels:
 
 The current batched correctness test uses `B=4`, `L=4`, `d_model=8`, and two attention heads and produces identical output to the explicit reference execution.
 
+### Causal multi-head attention
+
+A separate causal version of the strided fused attention kernel is implemented for autoregressive Transformer inference.
+
+For query position `i`, only key/value positions satisfying:
+
+**j <= i**
+
+participate in attention. Future positions are masked from the softmax.
+
+The causal implementation operates directly on projected `[B,L,d_model]` tensors and preserves the same strided head layout as the non-causal implementation.
+
+The causal path has been tested for individual heads and for batched multi-head attention. It has also been integrated with learned Q/K/V projections and tested at GPT-2 Small dimensions with `d_model=768` and `12` attention heads.
+
 ### Attention memory scaling
 
 The unfused and fused implementations have also been tested with increasing sequence lengths.
@@ -424,17 +467,15 @@ Run with:
 
 The next major steps are:
 
-- causal attention masking
-- Q/K/V projections using 3D linear layers
-- attention output projection
-- residual connections and layer normalization
-- Transformer feed-forward network
-- Transformer block
+- Transformer block abstraction
 - token and positional embeddings
-- tokenization integration
+- final layer normalization
 - GPT-2 weight loading
+- language-model head with tied token-embedding weights
+- tokenization integration
 - GPT-2 Small inference
 - autoregressive generation
+- test reorganization and optional test builds
 - further GPU kernel optimization
 
 The first complete pretrained model target is GPT-2 Small.
@@ -456,7 +497,7 @@ Longer term, the project may explore automatic differentiation and training.
 
 Work in progress.
 
-The project currently provides the main low-level GPU operations needed to begin constructing a Transformer inference pipeline.
+The project now contains the main computational components required for a GPT-2 Transformer block.
 
 Implemented components include:
 
@@ -469,79 +510,56 @@ Implemented components include:
 - 3D linear layers for `[B,L,D]` tensors
 - ReLU and GELU
 - serial and parallel softmax
-- serial and parallel layer normalization
-- feed-forward neural-network composition
+- affine parallel layer normalization
 - unfused scaled dot-product attention
 - fused attention using blockwise online softmax
 - multi-head attention
 - strided batched multi-head attention operating directly on `[B,L,d_model]`
+- causal strided multi-head attention
+- Q/K/V projections
+- attention output projection
+- Transformer residual connections
+- GPT-2-style feed-forward network
 
-The current Transformer-oriented data path is:
+The current Transformer block data path is:
 
 ```text
 X [B,L,d_model]
         |
-        | Linear projections
         v
-Q,K,V [B,L,d_model]
+   LayerNorm 1
         |
-        | strided multi-head attention
         v
-Attention output [B,L,d_model]
+   Q/K/V projections
+        |
+        v
+causal multi-head attention
+        |
+        v
+       W_O
+        |
+        v
+   residual + X
+        |
+        v
+        R
+        |
+        v
+   LayerNorm 2
+        |
+        v
+Linear d_model -> 4*d_model
+        |
+        v
+      GELU
+        |
+        v
+Linear 4*d_model -> d_model
+        |
+        v
+   residual + R
+        |
+        v
+      Output
 ```
 
-The 3D linear layer and the batched strided attention path have both been implemented and tested independently. The next step is to connect them into a single end-to-end attention pipeline.
-
-The strided attention implementation logically divides the model dimension into heads without physically rearranging the projected tensors into `[B,H,L,d_head]`. Each attention kernel operates directly on its feature slice using the original `d_model` memory stride.
-
-The fused attention kernel uses blockwise processing and online softmax to avoid materializing the complete attention score and softmax-weight matrices. It has been validated numerically against the unfused implementation and used to explore the difference between quadratic intermediate storage and blockwise attention.
-
-The batched strided multi-head implementation has been validated against explicit per-batch, per-head execution, with identical results in the current correctness test.
-
-The next development steps toward GPT-2 are:
-
-```text
-Token IDs
-    |
-    v
-Token + positional embedding
-    |
-    v
-X [B,L,d_model]
-    |
-    v
-LayerNorm
-    |
-    ├── Linear W_Q ──> Q ─┐
-    ├── Linear W_K ──> K ─┼──> causal multi-head attention
-    └── Linear W_V ──> V ─┘
-                           |
-                           v
-                    Linear W_O
-                           |
-                           v
-                     Residual add
-                           |
-                           v
-                      LayerNorm
-                           |
-                           v
-                 Linear d_model -> d_ff
-                           |
-                           v
-                         GELU
-                           |
-                           v
-                 Linear d_ff -> d_model
-                           |
-                           v
-                     Residual add
-```
-
-The immediate attention-specific requirement for GPT-2 is causal masking, so that a token at position `i` cannot attend to future positions.
-
-After the Transformer block is assembled, the remaining major components are token and positional embeddings, pretrained GPT-2 weight loading, tokenizer integration, the final language-model head, and autoregressive generation.
-
-The tokenizer will be provided by an existing implementation rather than reimplemented as part of this project. The embedding operation and Transformer inference path will be implemented in the project.
-
-This is an educational project for exploring C++, SYCL, GPU programming, GPU memory-access patterns, parallel reductions, kernel fusion, online softmax, multi-head attention, Transformer inference, and the internals of machine-learning frameworks. The kernels are intentionally implemented directly rather than delegating the work to optimized ML or BLAS libraries.
