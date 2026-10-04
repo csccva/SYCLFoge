@@ -254,6 +254,7 @@ Linear 3072 -> 768
         |
         v
 Y [B,L,768]
+```
 
 ### Fused attention with online softmax
 
