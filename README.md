@@ -79,6 +79,7 @@ Current operations include:
 - tiled matrix multiplication
 - tiled multiplication with a transposed second operand
 - scaled tiled multiplication with a transposed second operand
+- tiled online-softmax weighted-value product from precomputed attention scores
 - fused scaled dot-product attention using online softmax
 - multi-head attention
 - strided multi-head attention over `[B,L,d_model]` tensors
@@ -175,7 +176,7 @@ Both serial and parallel GPU implementations of softmax are available.
 
 The parallel implementation uses work-group reductions to compute the normalization across rows and serves as an exercise in implementing reduction-based neural-network operations with SYCL.
 
-The parallel softmax is used by the unfused scaled dot-product attention implementation. A separate online-softmax formulation is used by the fused attention kernel.
+The parallel softmax is used by the unfused scaled dot-product attention implementation. A separate online-softmax formulation is used by the tiled and fused attention kernels.
 
 ## Layer normalization
 
@@ -238,6 +239,28 @@ The resulting score matrix is normalized using the parallel softmax kernel and t
 
 This implementation provides a simple reference for exploring attention before kernel fusion.
 
+## Tiled softmax-weighted value product
+
+The `softmax_matmul_tiled` kernel computes the attention output directly from a precomputed score matrix and the value matrix:
+
+**O = softmax(S) V**
+
+where `S = QK^T / sqrt(d_k)`.
+
+Unlike the unfused implementation, this kernel does not materialize the full softmax-weight matrix. Instead, each work-group computes a tile of the output matrix while streaming through tiles of the sequence dimension.
+
+For each query row, the kernel maintains:
+
+- a running maximum `m`
+- a running normalization factor `l`
+- a running unnormalized output accumulator
+
+When a new score tile changes the running maximum, the previous output accumulator and normalization factor are rescaled to maintain numerical consistency.
+
+The work-group uses SYCL local memory to hold score and value tiles and processes the sequence dimension incrementally. The final output is obtained by dividing the accumulated weighted sum by the normalization factor.
+
+This kernel accepts precomputed scores, so it still requires the score matrix `S` in global memory. It is an intermediate step toward a fully fused attention kernel.
+
 ## Fused attention with online softmax
 
 A fused attention implementation has also been developed.
@@ -278,6 +301,14 @@ The fused implementation has been validated numerically against the unfused atte
 The implementation is inspired by the online-softmax/blockwise approach used by memory-efficient attention algorithms such as FlashAttention, but it is an educational implementation rather than a reproduction of an optimized FlashAttention kernel.
 
 In particular, the current implementation updates the running output accumulator through global device memory. A more optimized implementation would keep output fragments in per-thread private/register storage while streaming K/V blocks.
+
+### Next step: fully fused attention
+
+The planned `flash_attention_tiled` kernel will compute score tiles from `Q` and `K` on the fly, then apply online softmax and accumulate the corresponding contributions from `V`.
+
+This will eliminate the need to materialize the complete score matrix as well as the softmax-weight matrix in global memory.
+
+The fully fused implementation is still under development.
 
 ## Multi-head attention
 
@@ -451,6 +482,7 @@ tests/
 ├── test_nn.cpp
 ├── test_sdpa.cpp
 ├── test_attention.cpp
+├── test_flash_attention.cpp
 └── benchmark_ops.cpp
 ```
 
@@ -460,6 +492,7 @@ The test executables are grouped by purpose:
 - `test_nn.cpp` — activations, softmax, LayerNorm, Linear, and feed-forward/MLP operations
 - `test_sdpa.cpp` — scaled dot-product attention and fused online-softmax attention
 - `test_attention.cpp` — multi-head, strided, causal, and GPT-2 attention-path integration tests
+- `test_flash_attention.cpp` — CPU-reference comparison for tiled attention operations, including the online-softmax weighted-value product
 
 Performance experiments are kept separately in `benchmark_ops.cpp`.
 
@@ -501,6 +534,7 @@ tinyml/
 │       ├── device_buffer.hpp
 │       ├── tensor.hpp
 │       ├── ops.hpp
+│       ├── flash_attention.hpp
 │       └── linear.hpp
 ├── src/
 │   └── main.cpp
@@ -510,6 +544,7 @@ tinyml/
 │   ├── test_nn.cpp
 │   ├── test_sdpa.cpp
 │   ├── test_attention.cpp
+│   ├── test_flash_attention.cpp
 │   └── benchmark_ops.cpp
 └── build/
 ```
@@ -537,7 +572,7 @@ cmake --build build --target tinyml
 Build the correctness tests:
 
 ```bash
-cmake --build build --target test_core test_nn test_sdpa test_attention
+cmake --build build --target test_core test_nn test_sdpa test_attention test_flash_attention
 ```
 
 Build the benchmarks:
@@ -553,6 +588,7 @@ The individual executables can then be run directly, for example:
 ./build/test_nn
 ./build/test_sdpa
 ./build/test_attention
+./build/test_flash_attention
 ./build/benchmark_ops
 ```
 
@@ -636,6 +672,8 @@ The next major steps are:
 
 Attention optimization can later explore:
 
+- computing score tiles from `Q` and `K` on the fly
+- eliminating the full score matrix from global memory
 - register/private-memory output accumulation
 - improved work-group and output-fragment mapping
 - reduced synchronization and local-memory usage
@@ -666,6 +704,7 @@ Implemented components include:
 - serial and parallel softmax
 - affine parallel layer normalization
 - unfused scaled dot-product attention
+- tiled online-softmax weighted-value product from precomputed scores
 - fused attention using blockwise online softmax
 - multi-head attention
 - strided batched multi-head attention operating directly on `[B,L,d_model]`
@@ -680,4 +719,6 @@ Implemented components include:
 
 The current development boundary is the Transformer block abstraction: the underlying operations are implemented and independently validated, but they have not yet been packaged into a reusable Transformer block class.
 
-The next implementation step is therefore to combine the existing components into that abstraction before moving on to embeddings and full GPT-2 inference.
+The next attention-kernel step is to implement `flash_attention_tiled`, computing `QK^T` tiles on the fly and combining score computation, online softmax, and the weighted-value product without materializing the full score matrix.
+
+The next major model-development step remains to combine the existing components into a reusable Transformer block abstraction before moving on to embeddings and full GPT-2 inference.

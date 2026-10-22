@@ -98,6 +98,24 @@ if(TINYML_BUILD_TESTS)
         tests/benchmark_ops.cpp
     )
 
+        add_executable(test_flash_attention
+        tests/test_flash_attention.cpp
+    )
+
+    target_include_directories(test_flash_attention PRIVATE
+        include
+    )
+
+    target_compile_options(test_flash_attention PRIVATE
+        -fsycl
+        -fsycl-targets=spir64
+    )
+
+    target_link_options(test_flash_attention PRIVATE
+        -fsycl
+        -fsycl-targets=spir64
+    )
+    
     target_include_directories(benchmark_ops PRIVATE
         include
     )
