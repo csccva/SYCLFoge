@@ -1,141 +1,161 @@
 # tinyml
 
-A small machine-learning framework built from scratch in C++ and SYCL.
+A small machine-learning framework built from scratch in C++20 and SYCL.
 
-The goal of this project is educational: to understand how the core components of a neural-network framework can be implemented directly on a GPU, starting from memory management and tensor operations and eventually building a small Transformer/LLM inference pipeline.
+`tinyml` is an educational project for understanding how neural-network
+operations map to GPU kernels. It keeps memory management, tensor
+storage, GPU operations, neural-network layers, and Transformer
+components explicit rather than hiding them behind a large framework.
 
-The project deliberately uses minimal abstractions so that the path from a neural-network operation to the underlying SYCL GPU kernel remains visible.
+Development currently uses Intel oneAPI `icpx` and an Intel integrated
+GPU. The immediate model target is GPT-2 Small inference. The project
+has implemented and numerically validated a complete Transformer-block
+forward pass at GPT-2 Small block dimensions; tokenization,
+pretrained-weight loading, embeddings, stacking the full model, and
+autoregressive generation remain future work.
+
+## Current status
+
+The following configuration has passed the integrated
+`TransformerBlock::forward()` correctness test against CPU reference
+calculations:
+
+``` text
+B       = 2
+L       = 1024
+d_model = 768
+heads   = 12
+d_head  = 64
+FF      = 3072
+dtype   = float32
+```
+
+The test validates intermediate tensors and the final block output:
+input LayerNorm, Q/K/V projections, causal multi-head attention, output
+projection, residual path, second LayerNorm, feed-forward projection,
+GELU, second feed-forward projection, and final residual output. All
+comparisons passed with an absolute tolerance of `5e-4`. In this run,
+the largest reported absolute error was approximately `4.77e-7` for the
+second LayerNorm and `7.45e-8` for the final output.
+
+This is evidence of correctness for the tested configuration, not a
+proof for all shapes or inputs. The test uses deterministic inputs and
+weights, and the CPU reference shares the intended mathematical design.
+Randomized tests, more shape coverage, and independent checks are still
+useful. The test validates one Transformer block, not a complete
+pretrained GPT-2 model.
 
 ## Goals
 
-The long-term goal is to build a small Transformer capable of language-model inference using components implemented in this project.
+The project is intended to build understanding of GPU programming and ML
+internals by implementing the components needed for a small
+language-model inference pipeline.
 
-The development path is roughly:
+The development path is:
 
-1. GPU memory management
-2. Tensor abstraction
-3. Basic tensor operations
-4. Matrix multiplication
-5. Neural-network layers
-6. Feed-forward networks
-7. Scaled dot-product attention
-8. Multi-head attention
-9. Causal Transformer attention
-10. Transformer block
-11. Token and positional embeddings
-12. GPT-2 Small inference
-13. Autoregressive generation
+1.  GPU memory management and tensor storage
+2.  Basic tensor operations and matrix multiplication
+3.  Neural-network layers and activations
+4.  Softmax and LayerNorm
+5.  Scaled dot-product and multi-head attention
+6.  Causal attention and online softmax
+7.  A reusable Transformer block
+8.  Token and learned positional embeddings
+9.  GPT-2 weight loading and model assembly
+10. Tokenization and language-model output
+11. Autoregressive generation
+12. Further kernel optimization
 
-The initial focus is inference. The design may later be extended toward gradients and training.
+Inference is the initial focus. Automatic differentiation and training
+may be explored later.
 
-## Current functionality
+## Implemented functionality
 
-### Device memory
+### Device memory and tensors
 
-`DeviceBuffer<T>` provides basic RAII-based management of SYCL USM device memory.
+`DeviceBuffer<T>` provides RAII-style ownership of SYCL USM device
+allocations. It uses `sycl::malloc_device`, releases owned memory
+automatically, and prevents accidental shallow copies.
 
-It handles:
+`Tensor<T>` provides a minimal multidimensional tensor abstraction with
+shape metadata, element count, device storage, and access to the
+underlying device pointer.
 
-- device allocation with `sycl::malloc_device`
-- device memory ownership
-- automatic deallocation
-- prevention of accidental shallow copies
+Example:
 
-### Tensor
-
-`Tensor<T>` provides a minimal tensor abstraction containing:
-
-- tensor shape
-- number of elements
-- device storage
-- access to the underlying device pointer
-
-For example:
-
-```cpp
-tinyml::Tensor<float> X(queue,{32,128});
+``` cpp
+tinyml::Tensor<float> X(queue, {32, 128});
 ```
 
-creates a tensor representing 32 samples with 128 features each.
+This creates a tensor with shape `[32,128]`. Tensor data resides in
+device memory; host/device transfers are performed explicitly through
+the copy operations.
 
 ### Tensor operations
 
-Basic GPU operations are implemented in `ops.hpp`.
+GPU operations are implemented in `ops.hpp`. The current set includes:
 
-Current operations include:
+-   Host-to-device and device-to-host copies
+-   Elementwise arithmetic and addition
+-   Fill and scalar multiplication
+-   Bias addition
+-   ReLU
+-   Exact GELU and tanh-approximate GELU
+-   Serial and parallel softmax
+-   Serial and parallel LayerNorm
+-   Affine parallel LayerNorm
+-   Naive matrix multiplication
+-   Tiled matrix multiplication
+-   Tiled matrix multiplication with a transposed second operand
+-   Scaled tiled multiplication with a transposed second operand
+-   Tiled online-softmax weighted-value product from precomputed
+    attention scores
+-   Fused scaled dot-product attention using online softmax
+-   Multi-head attention
+-   Strided multi-head attention on `[B,L,d_model]` tensors
+-   Causal strided multi-head attention
 
-- host/device copies
-- elementwise arithmetic
-- fill
-- scalar multiplication
-- bias addition
-- ReLU
-- exact GELU
-- approximate GELU
-- serial and parallel softmax
-- serial and parallel layer normalization
-- affine parallel layer normalization
-- matrix multiplication
-- tiled matrix multiplication
-- tiled multiplication with a transposed second operand
-- scaled tiled multiplication with a transposed second operand
-- tiled online-softmax weighted-value product from precomputed attention scores
-- fused scaled dot-product attention using online softmax
-- multi-head attention
-- strided multi-head attention over `[B,L,d_model]` tensors
-- causal strided multi-head attention
+Operations return `sycl::event` objects where applicable. Event
+dependencies express ordering between asynchronous GPU operations.
 
-Operations return `sycl::event` objects so dependencies between asynchronous GPU operations can be expressed explicitly.
+### Matrix multiplication
 
-## Matrix multiplication
+Several matrix-multiplication kernels are available, including naive and
+tiled implementations. The tiled implementations use SYCL local memory
+to reuse matrix data within work-groups.
 
-Several matrix multiplication operations are currently available:
+The transposed operation computes
 
-- naïve matrix multiplication
-- tiled matrix multiplication using SYCL local memory
-- tiled `AB^T` matrix multiplication
-- scaled tiled `AB^T` matrix multiplication for attention
+\[ C = AB\^T \]
 
-The transposed operation computes:
+for `A` with shape `[M,K]`, `B` with shape `[N,K]`, and `C` with shape
+`[M,N]`. It avoids creating a physical transposed copy of `B`.
 
-**C = AB^T**
+A scaled variant computes
 
-for:
+\[ C = `\frac{AB^T}{\sqrt{K}}`{=tex}, \]
 
-- `A` with shape `[M,K]`
-- `B` with shape `[N,K]`
-- `C` with shape `[M,N]`
+which is the score calculation used by scaled dot-product attention when
+`A=Q`, `B=K`, and `K` is the attention head dimension. Local-memory
+padding is used in the transposed implementation to help reduce
+unfavorable bank-access patterns.
 
-This avoids explicitly constructing a transposed copy of `B`.
+These kernels are learning and optimization exercises, not replacements
+for tuned BLAS libraries.
 
-A scaled version computes:
+### Linear layers
 
-**C = AB^T / sqrt(K)**
+`Linear<T>` implements a fully connected layer:
 
-which provides the score computation required by scaled dot-product attention when `A = Q`, `B = K`, and the matrix dimension `K` corresponds to the attention dimension `d_k`.
+\[ Y = XW + b \]
 
-The tiled implementations use SYCL local memory to reuse matrix data within work-groups. Local-memory padding is used in the transposed implementation to reduce unfavorable strided bank-access patterns.
+where `X` has shape `[batch_size,in_features]`, `W` has shape
+`[in_features,out_features]`, `b` has shape `[out_features]`, and `Y`
+has shape `[batch_size,out_features]`.
 
-The matrix multiplication kernels are intended primarily for learning GPU optimization techniques. They are not intended to replace optimized BLAS implementations.
+The layer also supports Transformer-style 3D tensors:
 
-## Linear layer
-
-A basic fully connected layer is implemented:
-
-**Y = XW + b**
-
-where:
-
-- `X` has shape `[batch_size,in_features]`
-- `W` has shape `[in_features,out_features]`
-- `b` has shape `[out_features]`
-- `Y` has shape `[batch_size,out_features]`
-
-The matrix multiplication and bias kernels are connected through SYCL event dependencies.
-
-The linear layer also supports 3D Transformer-style tensors:
-
-```text
+``` text
 X [B,L,in_features]
         |
         v
@@ -145,338 +165,224 @@ X [B,L,in_features]
 Y [B,L,out_features]
 ```
 
-The `[B,L,in_features]` tensor is interpreted as a contiguous `[B*L,in_features]` matrix during matrix multiplication, so no physical reshape or data movement is required.
+The contiguous `[B,L,in_features]` tensor is treated as a
+`[B*L,in_features]` matrix for multiplication. No physical reshape or
+data movement is required.
 
-## Activation functions
+### Activation functions
 
-ReLU and GELU activation functions are implemented as SYCL GPU kernels.
+ReLU and two GELU formulations are implemented as SYCL kernels.
 
 ReLU:
 
-**ReLU(x) = max(0,x)**
+\[ `\operatorname{ReLU}`{=tex}(x)=`\max`{=tex}(0,x) \]
 
-Two GELU implementations are available:
+Exact GELU:
 
-- exact GELU using the error function
-- approximate GELU using the tanh approximation
+\[
+`\operatorname{GELU}`{=tex}(x)=`\frac{x}{2}`{=tex}`\left`{=tex}(1+`\operatorname{erf}`{=tex}`\left`{=tex}(`\frac{x}{\sqrt{2}}`{=tex}`\right`{=tex})`\right`{=tex})
+\]
 
-The exact formulation is:
+Tanh approximation:
 
-**GELU(x) = x / 2 * (1 + erf(x / sqrt(2)))**
+\[
+`\operatorname{GELU}`{=tex}(x)`\approx`{=tex}`\frac{x}{2}`{=tex}`\left[1+\tanh\left(\sqrt{\frac{2}{\pi}}(x+0.044715x^3)\right)\right]`{=tex}\]
 
-The approximate formulation is:
+The implementations have been compared against CPU references. Exact and
+approximate GELU have also been compared for numerical accuracy and
+execution time using SYCL event profiling.
 
-**GELU(x) ≈ x / 2 * [1 + tanh(sqrt(2 / pi) * (x + 0.044715x^3))]**
+### Softmax and LayerNorm
 
-Both implementations have been tested against CPU references. The exact and approximate implementations have also been compared for numerical accuracy and GPU execution time using SYCL event profiling.
+Both serial and parallel softmax implementations are available. The
+parallel version uses work-group reductions to normalize rows. It is
+used by the unfused attention path, while online-softmax state is used
+by the tiled and fused attention kernels.
 
-## Softmax
+Serial and parallel LayerNorm implementations are also available. The
+affine parallel version supports learned parameters:
 
-Both serial and parallel GPU implementations of softmax are available.
+\[
+Y=`\gamma`{=tex}`\frac{X-\mu}{\sqrt{\sigma^2+\epsilon}}`{=tex}+`\beta`{=tex}
+\]
 
-The parallel implementation uses work-group reductions to compute the normalization across rows and serves as an exercise in implementing reduction-based neural-network operations with SYCL.
+It is used in the pre-LayerNorm Transformer block.
 
-The parallel softmax is used by the unfused scaled dot-product attention implementation. A separate online-softmax formulation is used by the tiled and fused attention kernels.
+### Attention implementations
 
-## Layer normalization
+The project contains multiple attention implementations intended to make
+the algorithmic and memory trade-offs visible.
 
-Both serial and parallel implementations of layer normalization are available.
+#### Unfused scaled dot-product attention
 
-The parallel implementation uses SYCL work-group reductions to compute row statistics and supports learned affine parameters:
+The operation is
 
-**Y = gamma * (X - mean) / sqrt(variance + eps) + beta**
+\[
+`\operatorname{Attention}`{=tex}(Q,K,V)=`\operatorname{softmax}`{=tex}`\left`{=tex}(`\frac{QK^T}{\sqrt{d_k}}`{=tex}`\right`{=tex})V.
+\]
 
-The affine parallel implementation is used for the pre-LayerNorm structure of the GPT-2 Transformer block.
+The unfused path computes the score matrix with tiled `QK^T`, applies
+parallel softmax, and multiplies the weights by `V`. It is a useful
+reference implementation, but materializes the score and softmax-weight
+matrices.
 
-The implementation is primarily intended for learning parallel reduction techniques and floating-point behavior on GPUs.
+#### Tiled online-softmax weighted-value product
 
-## Feed-forward networks
+`softmax_matmul_tiled` computes `O = softmax(S)V` from precomputed
+scores `S`. It streams over sequence tiles and maintains a running
+maximum, normalization factor, and output accumulator. When a new tile
+changes the running maximum, the accumulated state is rescaled to
+preserve numerical consistency.
 
-The implemented operations can be composed into simple feed-forward neural networks using `Linear`, activation functions, and explicit SYCL event dependencies.
+This avoids materializing the complete softmax-weight matrix, but still
+requires the score matrix in global memory. It is an intermediate step
+toward fully fused attention.
 
-A GPT-2-style Transformer feed-forward path is also implemented:
+#### Fused attention with online softmax
 
-```text
-X [B,L,768]
-        |
-        v
-Linear 768 -> 3072
-        |
-        v
-      GELU
-        |
-        v
-Linear 3072 -> 768
-        |
-        v
-Y [B,L,768]
-```
+The fused online-softmax implementation processes blocks of `K` and `V`
+while maintaining the softmax state incrementally. For a new score tile
+with maximum `m_tile`, the running maximum is updated as
 
-The output can then be combined with the residual input using the elementwise addition operation.
+\[
+m\_{`\mathrm{new}`{=tex}}=`\max`{=tex}(m\_{`\mathrm{old}`{=tex}},m\_{`\mathrm{tile}`{=tex}}).
+\]
 
-This path has been tested independently at GPT-2 Small dimensions.
+The denominator and output accumulator are rescaled consistently as new
+tiles are processed. This avoids storing full score and softmax-weight
+matrices.
 
-## Scaled dot-product attention
+The implementation is inspired by the blockwise online-softmax approach
+used by memory-efficient algorithms such as FlashAttention. It is an
+educational implementation, not a reproduction of an optimized
+FlashAttention kernel. In particular, the current implementation updates
+the running output accumulator through global device memory; a more
+optimized implementation could keep output fragments in registers or
+private storage.
 
-Single-head scaled dot-product attention is implemented and tested.
+#### Multi-head and strided attention
 
-The operation is:
+The project supports an explicit head-separated representation
+`[B,H,L,d_head]` and a strided representation that operates directly on
+projected tensors:
 
-**Attention(Q,K,V) = softmax(QK^T / sqrt(d_k)) V**
-
-The initial implementation composes three existing GPU operations:
-
-```text
-Q ──┐
-    ├── QK^T / sqrt(d_k) ──> scores ──> softmax ──> weights ──┐
-K ──┘                                                         ├──> output
-V ────────────────────────────────────────────────────────────┘
-```
-
-The scaled score calculation uses the tiled transposed matrix-multiplication kernel, so an explicit transposed copy of `K` is not required.
-
-The resulting score matrix is normalized using the parallel softmax kernel and then multiplied by `V` using tiled matrix multiplication.
-
-This implementation provides a simple reference for exploring attention before kernel fusion.
-
-## Tiled softmax-weighted value product
-
-The `softmax_matmul_tiled` kernel computes the attention output directly from a precomputed score matrix and the value matrix:
-
-**O = softmax(S) V**
-
-where `S = QK^T / sqrt(d_k)`.
-
-Unlike the unfused implementation, this kernel does not materialize the full softmax-weight matrix. Instead, each work-group computes a tile of the output matrix while streaming through tiles of the sequence dimension.
-
-For each query row, the kernel maintains:
-
-- a running maximum `m`
-- a running normalization factor `l`
-- a running unnormalized output accumulator
-
-When a new score tile changes the running maximum, the previous output accumulator and normalization factor are rescaled to maintain numerical consistency.
-
-The work-group uses SYCL local memory to hold score and value tiles and processes the sequence dimension incrementally. The final output is obtained by dividing the accumulated weighted sum by the normalization factor.
-
-This kernel accepts precomputed scores, so it still requires the score matrix `S` in global memory. It is an intermediate step toward a fully fused attention kernel.
-
-## Fused attention with online softmax
-
-A fused attention implementation has also been developed.
-
-Instead of materializing the complete score and softmax-weight matrices, the kernel processes blocks of `K` and `V` while maintaining the softmax state incrementally.
-
-For each query row, the kernel maintains:
-
-- a running maximum `m`
-- a running softmax denominator `D`
-- a running unnormalized output `U`
-
-For a new score tile with maximum `m_tile`, the running maximum becomes:
-
-**m_new = max(m_old,m_tile)**
-
-and the denominator is updated using:
-
-**D_new = D_old * exp(m_old - m_new) + D_tile * exp(m_tile - m_new)**
-
-The output numerator is rescaled in the same way while accumulating the contribution from the corresponding `V` tile.
-
-After all key/value tiles have been processed, the accumulated output is normalized by the final denominator.
-
-This allows attention to be evaluated without storing the full:
-
-```text
-scores  [M,N]
-weights [M,N]
-```
-
-intermediate tensors.
-
-For fixed attention dimension `d_k`, this changes the intermediate-memory behavior from quadratic in sequence length to a blockwise streaming approach.
-
-The fused implementation has been validated numerically against the unfused attention implementation over multiple K/V tiles. For one larger correctness test with `M=127`, `N=259`, and `K=128`, the maximum difference between the implementations was approximately `6.2e-9`.
-
-The implementation is inspired by the online-softmax/blockwise approach used by memory-efficient attention algorithms such as FlashAttention, but it is an educational implementation rather than a reproduction of an optimized FlashAttention kernel.
-
-In particular, the current implementation updates the running output accumulator through global device memory. A more optimized implementation would keep output fragments in per-thread private/register storage while streaming K/V blocks.
-
-### Next step: fully fused attention
-
-The planned `flash_attention_tiled` kernel will compute score tiles from `Q` and `K` on the fly, then apply online softmax and accumulate the corresponding contributions from `V`.
-
-This will eliminate the need to materialize the complete score matrix as well as the softmax-weight matrix in global memory.
-
-The fully fused implementation is still under development.
-
-## Multi-head attention
-
-Multi-head attention is implemented using the fused online-softmax attention kernel.
-
-An initial implementation operates on tensors where the heads have already been physically separated:
-
-```text
-[B,H,L,d_head]
-```
-
-This implementation is retained as a useful reference.
-
-A second implementation operates directly on Transformer-style projected tensors:
-
-```text
+``` text
 Q [B,L,d_model]
 K [B,L,d_model]
 V [B,L,d_model]
 ```
 
-The model dimension is divided into attention heads:
+The feature dimension is logically divided among heads:
 
-**d_head = d_model / H**
+\[ d\_{`\mathrm{head}`{=tex}}=`\frac{d_{\mathrm{model}}}{H}`{=tex}. \]
 
-where `H` is the number of heads.
+For head `h`, the feature offset is `h * d_head`. The strided kernel
+uses the full `d_model` row stride while accessing only the features
+belonging to the selected head. It therefore avoids a physical
+rearrangement to `[B,H,L,d_head]`.
 
-Logically, the feature dimension is interpreted as:
+The implementation launches attention independently for each batch/head
+pair and joins the resulting SYCL events into a completion event.
 
-```text
-d_model
+#### Causal multi-head attention
 
-| head 0 | head 1 | head 2 | ... |
-```
+The causal kernel restricts each query at position `i` to keys and
+values at positions `j <= i`. Future positions are excluded from the
+softmax. It operates directly on `[B,L,d_model]` projected tensors and
+retains the strided head layout.
 
-Rather than physically rearranging the tensors into `[B,H,L,d_head]`, the strided attention kernel accesses each head directly inside the original `[B,L,d_model]` memory layout.
+Causal attention has been tested at component level and integrated into
+the Transformer block. A useful invariant is that the first token can
+attend only to itself, so its attention output equals its value vector
+for each head.
 
-For head `h`, the starting feature offset is:
+#### Attention memory experiments
 
-```text
-j_start = h * d_head
-```
+For square unfused attention with sequence length `N`, the score and
+softmax-weight matrices each have shape `[N,N]`. With FP32, those two
+matrices alone require `8*N*N` bytes.
 
-The attention kernel then uses the full `d_model` row stride while operating only on the `d_head` features belonging to that head.
+Previous experiments on the development Intel integrated GPU ran the
+unfused implementation at `N=32768`, where the two matrices together
+require approximately 8 GiB, and encountered a SYCL integer-range check
+at `N=49152`. The fused implementation ran through `N=65536` in the same
+experiment. These are observations from a particular experiment, not
+general hardware limits or performance claims.
 
-For each batch and head, the effective operation is therefore:
+### Transformer block
 
-```text
-Q[b,:,head] [L,d_head]
-K[b,:,head] [L,d_head]
-V[b,:,head] [L,d_head]
-             |
-             v
-      fused attention
-             |
-             v
-U[b,:,head] [L,d_head]
-```
+`TransformerBlock<T>` encapsulates the complete pre-LayerNorm block
+forward path. It owns the attention projections and feed-forward layers
+and exposes `forward()` to compose the operations through SYCL event
+dependencies.
 
-while the physical tensors remain:
+The data path is:
 
-```text
-[B,L,d_model]
-```
-
-This avoids an intermediate physical transpose or rearrangement from `[B,L,d_model]` to `[B,H,L,d_head]`.
-
-The implementation launches attention independently for each `(batch,head)` pair. The resulting SYCL events are collected and joined into a single completion event.
-
-The implementation has been tested at several levels:
-
-- multi-head attention using the explicit `[B,H,L,d_head]` representation
-- strided attention operating directly on `[B,L,d_model]`
-- batched strided multi-head attention
-- causal strided attention
-- batched causal strided multi-head attention
-
-## Causal multi-head attention
-
-A separate causal version of the strided fused attention kernel is implemented for autoregressive Transformer inference.
-
-For query position `i`, only key/value positions satisfying:
-
-**j <= i**
-
-participate in attention. Future positions are masked from the softmax.
-
-The causal implementation operates directly on projected `[B,L,d_model]` tensors and preserves the same strided head layout as the non-causal implementation.
-
-The causal path has been tested for individual heads and for batched multi-head attention. It has also been integrated with learned Q/K/V projections and tested at GPT-2 Small dimensions with `d_model=768` and `12` attention heads.
-
-## GPT-2 attention path
-
-The individual components of the GPT-2 attention sublayer have been integrated into a single correctness test.
-
-The tested data path is:
-
-```text
+``` text
 X [B,L,d_model]
         |
         v
-   LayerNorm 1
+     LayerNorm 1
         |
         v
-   Q / K / V
-   projections
+   Q / K / V projections
         |
         v
-causal multi-head
-    attention
+  causal multi-head attention
         |
         v
-       W_O
+    output projection
         |
         v
-   residual + X
+    residual add with X
         |
         v
-        R
+     LayerNorm 2
         |
         v
-   LayerNorm 2
+Linear d_model -> d_ff
+        |
+        v
+       GELU
+        |
+        v
+Linear d_ff -> d_model
+        |
+        v
+ residual add
+        |
+        v
+       Output
 ```
 
-The integration test uses GPT-2 Small dimensions:
+The block has been validated against CPU reference calculations at the
+following dimensions:
 
-```text
+``` text
 B       = 2
-L       = 128
+L       = 1024
 d_model = 768
 heads   = 12
 d_head  = 64
+d_ff    = 3072
 ```
 
-The GPU results are compared against CPU reference calculations for LayerNorm, attention, output projection, and the residual path.
+The test compares intermediate results as well as the final output. In
+the reported run, all comparisons passed with absolute tolerance `5e-4`;
+the largest absolute error was approximately `4.77e-7` for the second
+LayerNorm and `7.45e-8` for the final output. The inputs and weights in
+this test are deterministic. Broader randomized and multi-shape testing
+remains part of strengthening validation.
 
-The second LayerNorm is validated using the actual GPU residual as its CPU-reference input so that the LayerNorm kernel is tested independently from numerical differences accumulated by the preceding attention path.
+This validates a single block at GPT-2 Small dimensions. It does not
+mean that the complete GPT-2 model is implemented.
 
-## Attention memory scaling
+## Testing and benchmarks
 
-The unfused and fused implementations have also been tested with increasing sequence lengths.
+Correctness tests are separated from performance experiments. The
+current test layout is:
 
-For square attention with `M=N`, the unfused implementation requires two large intermediate matrices:
-
-```text
-scores  [N,N]
-weights [N,N]
-```
-
-For FP32, these two matrices alone require:
-
-**8N^2 bytes**
-
-The unfused implementation successfully ran at `N=32768`, where the score and weight matrices together require approximately 8 GiB.
-
-The next tested size, `N=49152`, encountered the default SYCL integer-range check rather than an out-of-memory failure.
-
-The fused implementation, which does not allocate these quadratic intermediates, successfully ran through `N=65536` in the same experiment.
-
-These tests demonstrate the different memory-scaling behavior of the two approaches. They should not be interpreted as representative performance measurements of dedicated GPU hardware.
-
-Current development and benchmarking are performed on an Intel integrated GPU that also drives the operating-system display, so performance measurements can be affected by other GPU activity and shared-memory behavior.
-
-## Tests and benchmarks
-
-Correctness tests are separated from the main executable and organized by component:
-
-```text
+``` text
 tests/
 ├── test_core.cpp
 ├── test_nn.cpp
@@ -486,45 +392,111 @@ tests/
 └── benchmark_ops.cpp
 ```
 
-The test executables are grouped by purpose:
+The intended responsibilities are:
 
-- `test_core.cpp` — basic tensor operations and matrix multiplication
-- `test_nn.cpp` — activations, softmax, LayerNorm, Linear, and feed-forward/MLP operations
-- `test_sdpa.cpp` — scaled dot-product attention and fused online-softmax attention
-- `test_attention.cpp` — multi-head, strided, causal, and GPT-2 attention-path integration tests
-- `test_flash_attention.cpp` — CPU-reference comparison for tiled attention operations, including the online-softmax weighted-value product
+-   `test_core.cpp` --- tensor operations and matrix multiplication
+-   `test_nn.cpp` --- activations, softmax, LayerNorm, Linear, and
+    feed-forward/MLP operations
+-   `test_sdpa.cpp` --- scaled dot-product attention and fused
+    online-softmax attention
+-   `test_attention.cpp` --- multi-head, strided, causal, and
+    Transformer-block integration tests
+-   `test_flash_attention.cpp` --- CPU-reference comparisons for tiled
+    attention operations, including online-softmax weighted-value
+    products
+-   `benchmark_ops.cpp` --- performance experiments, including GELU
+    variants, tiled matrix multiplication, fused versus unfused
+    attention, and sequence-length scaling
 
-Performance experiments are kept separately in `benchmark_ops.cpp`.
+The exact contents of test executables can evolve as the project
+develops. Keep correctness checks and performance benchmarks separate so
+performance experiments do not obscure validation results.
 
-Current benchmarks include:
+## GPT-2 Small target
 
-- exact versus approximate GELU
-- tiled matrix multiplication
-- fused versus unfused attention
-- attention scaling with sequence length
+GPT-2 Small is the first intended pretrained-model target. Its standard
+architecture is:
 
-A separate attention maximum-size experiment is also available for exploring the different memory behavior of fused and unfused attention.
+``` text
+vocabulary size       = 50257
+context length        = 1024
+d_model               = 768
+attention heads       = 12
+d_head                = 64
+Transformer blocks    = 12
+feed-forward dimension= 3072
+```
 
-Keeping correctness tests and performance experiments separate allows the normal executable to remain minimal while individual components can be tested or benchmarked independently.
+The computational operations for one GPT-2-style block are implemented
+and the block forward pass has passed a CPU-reference comparison at
+these dimensions. The complete model still requires token embeddings,
+learned positional embeddings, assembly of 12 blocks, final LayerNorm,
+loading pretrained weights, the language-model head, and
+tokenization/generation integration.
+
+## Building
+
+A SYCL-capable C++ compiler is required. Development currently uses
+Intel oneAPI `icpx`.
+
+Configure with tests enabled:
+
+``` bash
+cmake -S . -B build \
+  -DCMAKE_CXX_COMPILER=icpx \
+  -DTINYML_BUILD_TESTS=ON
+```
+
+Build the main executable:
+
+``` bash
+cmake --build build --target tinyml
+```
+
+Build correctness tests:
+
+``` bash
+cmake --build build --target test_core test_nn test_sdpa test_attention test_flash_attention
+```
+
+Build the benchmark executable:
+
+``` bash
+cmake --build build --target benchmark_ops
+```
+
+Run the executables:
+
+``` bash
+./build/test_core
+./build/test_nn
+./build/test_sdpa
+./build/test_attention
+./build/test_flash_attention
+./build/benchmark_ops
+```
+
+The target names above reflect the project layout described here; check
+`CMakeLists.txt` if a target differs in your current checkout.
 
 ## Design principles
 
-The project currently follows a few simple rules:
+-   C++20
+-   SYCL for GPU programming
+-   USM device memory
+-   Explicit `nd_range` kernels where appropriate
+-   Asynchronous operations linked through `sycl::event`
+-   Minimal abstractions
+-   GPU operations separated from neural-network layers
+-   Correctness before optimization
+-   CPU references used to validate GPU results
 
-- C++20
-- SYCL for GPU programming
-- USM device memory
-- explicit `nd_range` kernels
-- asynchronous operations using `sycl::event`
-- minimal abstractions
-- GPU operations kept separate from neural-network layers
-- correctness before optimization
-
-The intention is to understand the implementation rather than hide it behind a large framework.
+The purpose is to make the path from a neural-network operation to the
+underlying SYCL kernel understandable.
 
 ## Project structure
 
-```text
+``` text
 tinyml/
 ├── CMakeLists.txt
 ├── LICENSE
@@ -535,7 +507,8 @@ tinyml/
 │       ├── tensor.hpp
 │       ├── ops.hpp
 │       ├── flash_attention.hpp
-│       └── linear.hpp
+│       ├── linear.hpp
+│       └── transformer_block.hpp
 ├── src/
 │   └── main.cpp
 ├── examples/
@@ -549,176 +522,48 @@ tinyml/
 └── build/
 ```
 
-## Building
-
-A SYCL-capable C++ compiler is required.
-
-The project is currently developed using Intel oneAPI `icpx`.
-
-Configure the project with tests enabled:
-
-```bash
-cmake -S . -B build \
-  -DCMAKE_CXX_COMPILER=icpx \
-  -DTINYML_BUILD_TESTS=ON
-```
-
-Build the main executable:
-
-```bash
-cmake --build build --target tinyml
-```
-
-Build the correctness tests:
-
-```bash
-cmake --build build --target test_core test_nn test_sdpa test_attention test_flash_attention
-```
-
-Build the benchmarks:
-
-```bash
-cmake --build build --target benchmark_ops
-```
-
-The individual executables can then be run directly, for example:
-
-```bash
-./build/test_core
-./build/test_nn
-./build/test_sdpa
-./build/test_attention
-./build/test_flash_attention
-./build/benchmark_ops
-```
-
-The normal `tinyml` executable is intentionally minimal while the framework is under development.
-
-## GPT-2 Small target
-
-The first complete pretrained model target is GPT-2 Small.
-
-The target architecture uses:
-
-```text
-vocabulary size = 50257
-context length  = 1024
-d_model         = 768
-attention heads = 12
-d_head          = 64
-Transformer layers = 12
-feed-forward dimension = 3072
-```
-
-The intended Transformer block is a pre-LayerNorm architecture:
-
-```text
-X
-|
-v
-LayerNorm 1
-|
-v
-Q/K/V projections
-|
-v
-causal multi-head attention
-|
-v
-output projection
-|
-v
-residual add
-|
-v
-R
-|
-v
-LayerNorm 2
-|
-v
-Linear 768 -> 3072
-|
-v
-GELU
-|
-v
-Linear 3072 -> 768
-|
-v
-residual add
-|
-v
-Output
-```
-
-All of the computational operations required by this block have now been implemented and tested independently. The next step is to encapsulate this data path in a reusable Transformer block abstraction.
+This is a representative structure; adjust it to match the files present
+in the current checkout.
 
 ## Roadmap
 
-The next major steps are:
+The next steps are:
 
-- Transformer block abstraction
-- dedicated Transformer block correctness test
-- token embeddings
-- learned positional embeddings
-- final layer normalization
-- GPT-2 weight loading
-- language-model head with tied token-embedding weights
-- tokenization integration
-- GPT-2 Small inference
-- autoregressive generation
-- further GPU kernel optimization
+-   Add randomized inputs and weights with multiple seeds to
+    Transformer-block correctness tests
+-   Expand shape coverage across batch size, sequence length, embedding
+    dimension, head count, and feed-forward width
+-   Add token embeddings and learned positional embeddings
+-   Add final model LayerNorm and GPT-2 weight loading
+-   Assemble the 12-block GPT-2 Small model
+-   Add the language-model head and tied token-embedding weights
+-   Integrate tokenization
+-   Implement autoregressive generation
+-   Profile and optimize bottlenecks after correctness is established
+-   Continue attention-kernel work: compute `QK^T` tiles on the fly,
+    avoid materializing the score matrix, keep output fragments in
+    registers/private storage, and tune work-group mapping and
+    synchronization
+-   Explore a Triton version of the attention algorithm to compare its
+    programming model with SYCL
+-   Explore portability to another SYCL implementation such as
+    AdaptiveCpp
+-   Consider automatic differentiation and training as a longer-term
+    extension
 
-Attention optimization can later explore:
+## Status summary
 
-- computing score tiles from `Q` and `K` on the fly
-- eliminating the full score matrix from global memory
-- register/private-memory output accumulation
-- improved work-group and output-fragment mapping
-- reduced synchronization and local-memory usage
-- architecture-specific tuning
+Implemented and tested components include USM device memory management,
+multidimensional tensors, host/device transfers, elementwise operations,
+naive and tiled matrix multiplication, linear layers, ReLU and GELU,
+serial and parallel softmax, affine parallel LayerNorm, unfused scaled
+dot-product attention, tiled online-softmax weighted-value products,
+fused online-softmax attention, multi-head and strided attention, causal
+attention, Q/K/V projections, attention output projection, residual
+connections, the Transformer feed-forward path, and a reusable
+`TransformerBlock<T>` forward pass.
 
-A parallel learning path is to implement the attention algorithm in Triton and compare its block and register programming model with the SYCL implementation.
-
-After the SYCL implementation is sufficiently complete, portability to another SYCL implementation such as AdaptiveCpp can also be explored.
-
-Longer term, the project may explore automatic differentiation and training.
-
-## Status
-
-Work in progress.
-
-The project now contains the computational components required for a GPT-2 Transformer block.
-
-Implemented components include:
-
-- USM-based device memory management
-- multidimensional tensor storage
-- host/device transfers
-- elementwise tensor operations
-- naïve and tiled matrix multiplication
-- linear layers
-- 3D linear layers for `[B,L,D]` tensors
-- ReLU and GELU
-- serial and parallel softmax
-- affine parallel layer normalization
-- unfused scaled dot-product attention
-- tiled online-softmax weighted-value product from precomputed scores
-- fused attention using blockwise online softmax
-- multi-head attention
-- strided batched multi-head attention operating directly on `[B,L,d_model]`
-- causal strided multi-head attention
-- Q/K/V projections
-- attention output projection
-- Transformer residual connections
-- GPT-2-style feed-forward network
-- first and second pre-LayerNorm stages
-- component-level and integrated attention-path correctness tests
-- separate correctness-test and benchmark executables
-
-The current development boundary is the Transformer block abstraction: the underlying operations are implemented and independently validated, but they have not yet been packaged into a reusable Transformer block class.
-
-The next attention-kernel step is to implement `flash_attention_tiled`, computing `QK^T` tiles on the fly and combining score computation, online softmax, and the weighted-value product without materializing the full score matrix.
-
-The next major model-development step remains to combine the existing components into a reusable Transformer block abstraction before moving on to embeddings and full GPT-2 inference.
+The current milestone is a validated single Transformer block at GPT-2
+Small dimensions. The next major milestone is a complete pretrained
+GPT-2 Small inference path, including embeddings, model weights,
+tokenization, and autoregressive generation.
