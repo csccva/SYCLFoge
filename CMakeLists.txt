@@ -161,4 +161,21 @@ if(TINYML_BUILD_TESTS)
         -fsycl
         -fsycl-targets=spir64
     )
+        add_executable(test_embedding
+        tests/test_embedding.cpp
+    )
+
+    target_include_directories(test_embedding PRIVATE
+        include
+    )
+
+    target_compile_options(test_embedding PRIVATE
+        -fsycl
+        -fsycl-targets=spir64
+    )
+
+    target_link_options(test_embedding PRIVATE
+        -fsycl
+        -fsycl-targets=spir64
+    )
 endif()

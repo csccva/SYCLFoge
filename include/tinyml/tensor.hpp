@@ -29,6 +29,10 @@ namespace tinyml {
             {
                 return data_.data();
             }
+            const T* data() const
+            {
+                return data_.data();
+            }
             Tensor(sycl::queue& queue, std::vector<std::size_t> shape): shape_(shape), data_(queue, numel())
             {
 

@@ -24,6 +24,10 @@ namespace tinyml {
         {
             return data_;
         }
+        const T* data() const
+        {
+            return data_;
+        }
 
         std::size_t size() const
         {
