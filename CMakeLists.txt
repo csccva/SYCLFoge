@@ -115,7 +115,7 @@ if(TINYML_BUILD_TESTS)
         -fsycl
         -fsycl-targets=spir64
     )
-    
+
     target_include_directories(benchmark_ops PRIVATE
         include
     )
@@ -126,6 +126,38 @@ if(TINYML_BUILD_TESTS)
     )
 
     target_link_options(benchmark_ops PRIVATE
+        -fsycl
+        -fsycl-targets=spir64
+    )
+        add_executable(benchmark_flash_attention
+        tests/benchmark_flash_attention.cpp
+    )
+
+    target_include_directories(benchmark_flash_attention PRIVATE
+        include
+    )
+
+    target_compile_options(benchmark_flash_attention PRIVATE
+        -fsycl
+        -fsycl-targets=spir64
+    )
+
+    target_link_options(benchmark_flash_attention PRIVATE
+        -fsycl
+        -fsycl-targets=spir64
+    )
+    add_executable(test_transformer_block
+        tests/test_transformer_block.cpp
+    )
+
+    target_include_directories(test_transformer_block PRIVATE include)
+
+    target_compile_options(test_transformer_block PRIVATE
+        -fsycl
+        -fsycl-targets=spir64
+    )
+
+    target_link_options(test_transformer_block PRIVATE
         -fsycl
         -fsycl-targets=spir64
     )

@@ -219,8 +219,11 @@ namespace ops{
             }
         }
 
+        // Join event: an empty command group with only depends_on is not reliably
+        // ordered on all implementations, so use an explicit no-op kernel.
         return queue.submit([&](sycl::handler& h){
             h.depends_on(head_events);
+            h.single_task([=]() {});
         });
     }
 
@@ -435,6 +438,7 @@ namespace ops{
 
         return queue.submit([&](sycl::handler& h){
             h.depends_on(head_events);
+            h.single_task([=]() {});
         });
     }
 
@@ -634,9 +638,13 @@ namespace ops{
                 l_deps.push_back(e);
             }
         }
+
+        // ordered on all implementations, so use an explicit no-op kernel.
         return queue.submit([&](sycl::handler& h){
             h.depends_on(l_deps);
+            h.single_task([=]() {});
         });
+
     }
 
     template <typename T>
