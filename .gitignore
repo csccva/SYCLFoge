@@ -4,3 +4,21 @@ CMakeCache.txt
 Makefile
 cmake_install.cmake
 test_sycl
+
+# Python virtual environment and generated Python files
+/.venv/
+__pycache__/
+*.py[cod]
+
+# CMake build products and diagnostic output
+/build/
+
+# Downloaded pretrained GPT-2 checkpoint
+/models/gpt2/model.safetensors
+
+# Exported GPT-2 parameters
+/models/gpt2/token_embeddings.bin
+/models/gpt2/position_embeddings.bin
+/models/gpt2/final_ln_gamma.bin
+/models/gpt2/final_ln_beta.bin
+/models/gpt2/block*/

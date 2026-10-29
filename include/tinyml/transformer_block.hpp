@@ -41,6 +41,11 @@ namespace tinyml {
         Linear<T>& ff1() { return FF1_; }
         Linear<T>& ff2() { return FF2_; }
 
+        Tensor<T>& ln1_gamma() { return gamma1_; }
+        Tensor<T>& ln1_beta()  { return beta1_; }
+        Tensor<T>& ln2_gamma() { return gamma2_; }
+        Tensor<T>& ln2_beta()  { return beta2_; }
+
         sycl::event forward(Tensor<T>& X,Tensor<T>& Y,Tensor<T>& X_norm,Tensor<T>& Q,Tensor<T>& K,Tensor<T>& V,Tensor<T>& A,Tensor<T>& R,Tensor<T>& R_norm,Tensor<T>& F1,Tensor<T>& F1_gelu,Tensor<T>& F2,std::size_t group_size,std::size_t tile_size,const std::vector<sycl::event>& dependencies = {})
         {
             auto e1 = ops::layer_norm_parallel(queue_,X.data(),gamma1_.data(),beta1_.data(),X_norm.data(),X.size()/d_model_,d_model_,group_size,dependencies);

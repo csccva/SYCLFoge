@@ -845,105 +845,103 @@ namespace ops{
 
     }
 
-    template <typename T>
-    sycl::event layer_norm_parallel(sycl::queue& queue,T *input,T *gamma,T *beta,T *output,std::size_t M,std::size_t N,std::size_t group_size,const std::vector<sycl::event>& dependencies={}){
-        return queue.submit([&](sycl::handler& h) {        
-                sycl::local_accessor<T, 1> local_A(sycl::range<1>(group_size), h); // to store the intermidiate max value and later the intermidiate sums
-                h.depends_on(dependencies);           
-
-                h.parallel_for(sycl::nd_range<1>(M*group_size,group_size), [=](sycl::nd_item<1> item)
-                {
-                    std::size_t i_row = item.get_group(0);                
-                    std::size_t local_j= item.get_local_id(0);
-                                                           
-                    T row_sum=static_cast<T>(0);
-                    if(local_j<N){
-                        row_sum=input[i_row*N+local_j]; //work item maximum
-                    }
-                    for(std::size_t j=local_j+group_size;j<N;j+=group_size){
-                        row_sum+=input[i_row*N+j];
-                    }
-                    local_A[local_j]=row_sum;
-                    item.barrier(sycl::access::fence_space::local_space); // barrier within the group
-                    for(std::size_t stride = group_size / 2;stride>0;stride>>=1){
-                        if(local_j<stride){
-                            local_A[local_j]+=local_A[local_j+stride];
-                        }
-                        item.barrier(sycl::access::fence_space::local_space); // barrier within the group
-                    }        
-                    row_sum= local_A[0]/static_cast<T>(N); 
-
-                    item.barrier(sycl::access::fence_space::local_space); // barrier within the group //not needed here
-                    T row_var=static_cast<T>(0);
-                    if(local_j<N){
-                        row_var=(input[i_row*N+local_j]-row_sum)*(input[i_row*N+local_j]-row_sum); //work item maximum
-                    }
-                    for(std::size_t j=local_j+group_size;j<N;j+=group_size){
-                        row_var+=(input[i_row*N+j]-row_sum)*(input[i_row*N+j]-row_sum); //input[i_row*N+j];
-                    }
-                    local_A[local_j]=row_var;
-                    item.barrier(sycl::access::fence_space::local_space); // barrier within the group
-                    for(std::size_t stride = group_size / 2;stride>0;stride>>=1){
-                        if(local_j<stride){
-                            local_A[local_j]+=local_A[local_j+stride];
-                        }
-                        item.barrier(sycl::access::fence_space::local_space); // barrier within the group
-                    }        
-                    row_var= local_A[0]/static_cast<T>(N);
-                    //item.barrier(sycl::access::fence_space::local_space); // barrier within the group //not needed here
-                    
-                    for(std::size_t j=local_j;j<N;j+=group_size){
-                        T normalized=(input[i_row*N+j]-row_sum)/sycl::sqrt(row_var+eps);
-                        output[i_row*N+j]=gamma[j]*normalized+beta[j];
-                    }
-                }
-            );
-        });
-    }
-
     
     template <typename T>
-    sycl::event layer_norm_parallel(sycl::queue& queue,tinyml::Tensor<T>& input,tinyml::Tensor<T>& gamma,tinyml::Tensor<T>& beta,tinyml::Tensor<T>& output,std::size_t group_size,const std::vector<sycl::event>& dependencies={}){
-        if(input.shape().size()!=2 || output.shape().size()!=2 || input.shape()!=output.shape() || input.shape()[0]==0 || input.shape()[1]==0){
-            throw std::invalid_argument("layer_norm_parallel: input and output must be 2D, non-empty, and have matching shapes");
-        }
-        if(gamma.shape().size()!=1 || beta.shape().size()!=1 || gamma.shape()[0]!=input.shape()[1] || beta.shape()[0]!=input.shape()[1]){
-            throw std::invalid_argument("layer_norm_parallel: gamma and beta must match the last dimension");
-        }
-        if(group_size==0 || (group_size & (group_size-1))!=0){
-            throw std::invalid_argument("layer_norm_parallel: group_size must be a power of 2");
-        }
+    sycl::event layer_norm_parallel(sycl::queue& queue, const T* input, T* gamma, T* beta, T* output, std::size_t M, std::size_t N, std::size_t group_size, T epsilon = static_cast<T>(1.0e-5), const std::vector<sycl::event>& dependencies = {}) {
+        if (M == 0 || N == 0) throw std::invalid_argument("layer_norm_parallel: M and N must be greater than zero");
+        if (group_size == 0 || (group_size & (group_size - 1)) != 0) throw std::invalid_argument("layer_norm_parallel: group_size must be a power of two");
+        if (epsilon <= static_cast<T>(0)) throw std::invalid_argument("layer_norm_parallel: epsilon must be greater than zero");
 
-        std::size_t M=input.shape()[0];
-        std::size_t N=input.shape()[1];
+        return queue.submit([&](sycl::handler& h) {
+            sycl::local_accessor<T, 1> local_A(sycl::range<1>(group_size), h);
+            h.depends_on(dependencies);
 
-        return layer_norm_parallel(queue,input.data(),gamma.data(),beta.data(),output.data(),M,N,group_size,dependencies);
+            h.parallel_for(sycl::nd_range<1>(sycl::range<1>(M * group_size), sycl::range<1>(group_size)), [=](sycl::nd_item<1> item) {
+                const std::size_t row = item.get_group(0);
+                const std::size_t local_j = item.get_local_id(0);
+
+                const T reference = input[row * N];
+                T row_sum = static_cast<T>(0);
+                for (std::size_t j = local_j; j < N; j += group_size) row_sum += input[row * N + j] - reference;
+                local_A[local_j] = row_sum;
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (std::size_t stride = group_size / 2; stride > 0; stride >>= 1) {
+                    if (local_j < stride) local_A[local_j] += local_A[local_j + stride];
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                const T mean = reference + local_A[0] / static_cast<T>(N);
+                item.barrier(sycl::access::fence_space::local_space);
+                T row_var = static_cast<T>(0);
+                for (std::size_t j = local_j; j < N; j += group_size) {
+                    const T difference = input[row * N + j] - mean;
+                    row_var += difference * difference;
+                }
+                local_A[local_j] = row_var;
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (std::size_t stride = group_size / 2; stride > 0; stride >>= 1) {
+                    if (local_j < stride) local_A[local_j] += local_A[local_j + stride];
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                const T variance = local_A[0] / static_cast<T>(N);
+                item.barrier(sycl::access::fence_space::local_space);
+                const T inverse_std = static_cast<T>(1) / sycl::sqrt(variance + epsilon);
+
+                for (std::size_t j = local_j; j < N; j += group_size) {
+                    const T normalized = (input[row * N + j] - mean) * inverse_std;
+                    output[row * N + j] = gamma[j] * normalized + beta[j];
+                }
+            });
+        });
+    }
+    
+    template <typename T>
+    sycl::event layer_norm_parallel(sycl::queue& queue, const T* input, T* gamma, T* beta, T* output, std::size_t M, std::size_t N, std::size_t group_size, const std::vector<sycl::event>& dependencies) {
+        return layer_norm_parallel<T>(queue, input, gamma, beta, output, M, N, group_size, static_cast<T>(1.0e-5), dependencies);
+    }
+    template <typename T>
+    sycl::event layer_norm_parallel(sycl::queue& queue, const tinyml::Tensor<T>& input, tinyml::Tensor<T>& gamma, tinyml::Tensor<T>& beta, tinyml::Tensor<T>& output, std::size_t group_size, const std::vector<sycl::event>& dependencies = {}) {
+        const auto input_shape = input.shape();
+        if (input_shape.size() != 2 || output.shape() != input_shape || input_shape[0] == 0 || input_shape[1] == 0) throw std::invalid_argument("layer_norm_parallel: input and output must be 2D, non-empty, and have matching shapes");
+        if (gamma.shape() != std::vector<std::size_t>{input_shape[1]} || beta.shape() != std::vector<std::size_t>{input_shape[1]}) throw std::invalid_argument("layer_norm_parallel: gamma and beta must match the feature dimension");
+        return layer_norm_parallel(queue, input.data(), gamma.data(), beta.data(), output.data(), input_shape[0], input_shape[1], group_size, static_cast<T>(1.0e-5), dependencies);
     }
 
+
     template <typename T>
-    sycl::event layer_norm(sycl::queue& queue,T *input, T *output, std::size_t M, std::size_t N, std::size_t group_size, const std::vector<sycl::event>& dependencies={}){
-        return queue.parallel_for(sycl::nd_range<1>(((M + group_size - 1) / group_size) * group_size,group_size),dependencies, [=](sycl::nd_item<1> item)
-        {
-            std::size_t index=item.get_global_id(0);
-            std::size_t i_start=index*N;
-            if (index < M) {
-                T row_sum=input[i_start];
-                for(std::size_t j=i_start+1;j<i_start+N;j++){
-                    row_sum+=input[j];
+    sycl::event layer_norm(sycl::queue& queue, T* input, T* output, std::size_t M, std::size_t N, std::size_t group_size, const std::vector<sycl::event>& dependencies = {}) {
+        if (M == 0 || N == 0) throw std::invalid_argument("layer_norm: M and N must be greater than zero");
+        if (group_size == 0) throw std::invalid_argument("layer_norm: group_size must be greater than zero");
+    
+        return queue.parallel_for(sycl::nd_range<1>(((M + group_size - 1) / group_size) * group_size, group_size), dependencies, [=](sycl::nd_item<1> item) {
+            const std::size_t row = item.get_global_id(0);
+    
+            if (row < M) {
+                const std::size_t i_start = row * N;
+                const T reference = input[i_start];
+                T centered_sum = static_cast<T>(0);
+    
+                for (std::size_t j = 0; j < N; j++) centered_sum += input[i_start + j] - reference;
+    
+                const T mean = reference + centered_sum / static_cast<T>(N);
+                T row_var = static_cast<T>(0);
+    
+                for (std::size_t j = 0; j < N; j++) {
+                    const T difference = input[i_start + j] - mean;
+                    row_var += difference * difference;
                 }
-                row_sum/=static_cast<T>(N);
-                T row_var=(input[i_start]-row_sum)*(input[i_start]-row_sum);
-                for(std::size_t j=i_start+1;j<i_start+N;j++){
-                    row_var+=(input[j]-row_sum)*(input[j]-row_sum);
-                }
-                row_var/=static_cast<T>(N);
-                for(std::size_t j=i_start;j<i_start+N;j++){
-                    output[j]=(input[j]-row_sum)/sycl::sqrt(row_var+eps);
-                }
+    
+                row_var /= static_cast<T>(N);
+                const T inverse_std = static_cast<T>(1) / sycl::sqrt(row_var + static_cast<T>(eps));
+    
+                for (std::size_t j = 0; j < N; j++) output[i_start + j] = (input[i_start + j] - mean) * inverse_std;
             }
         });
     }
- 
+    
     
     template <typename T>
     sycl::event layer_norm(sycl::queue& queue, tinyml::Tensor<T>& input, tinyml::Tensor<T>& output, std::size_t group_size, const std::vector<sycl::event>& dependencies={}){

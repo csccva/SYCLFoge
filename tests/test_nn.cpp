@@ -3,6 +3,7 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <iomanip>
 
 #include "tinyml/device_buffer.hpp"
 #include "tinyml/tensor.hpp"
@@ -688,6 +689,28 @@ int main()
         // Numerical validation
         // -----------------------------------------------------
 
+        std::cout << "\n=== Serial LayerNorm Diagnostics ===\n";
+
+        for (std::size_t i = 0; i < M; i++) {
+            float row_max_diff = 0.0f;
+            std::size_t max_j = 0;
+
+            for (std::size_t j = 0; j < N; j++) {
+                float diff = std::abs(h_serial[i * N + j] - h_reference[i * N + j]);
+                if (diff > row_max_diff) {
+                    row_max_diff = diff;
+                    max_j = j;
+                }
+            }
+
+            std::cout << "Row " << i
+                    << ": max error=" << row_max_diff
+                    << ", column=" << max_j
+                    << ", serial=" << h_serial[i * N + max_j]
+                    << ", parallel=" << h_parallel[i * N + max_j]
+                    << ", reference=" << h_reference[i * N + max_j]
+                    << '\n';
+        }
         float max_serial_parallel_diff = 0.0f;
         float max_serial_reference_diff = 0.0f;
         float max_parallel_reference_diff = 0.0f;
@@ -871,382 +894,179 @@ int main()
         }
     }
 
+    
     {
-        std::cout
-            << "\n=== Parallel LayerNorm Test ===\n";
+        std::cout << "\n=== Parallel LayerNorm Test ===\n";
 
         const std::size_t M = 3;
         const std::size_t N = 1000;
         const std::size_t group_size = 256;
-
         const float epsilon = 1.0e-5f;
-
-        // -----------------------------------------------------
-        // Input
-        // -----------------------------------------------------
 
         std::vector<float> h_in(M * N);
 
         for (std::size_t i = 0; i < M; i++) {
-
             for (std::size_t j = 0; j < N; j++) {
-
-                if (i == 0) {
-
-                    h_in[i * N + j] =
-                        static_cast<float>(j % 17)
-                        * 0.1f;
-                }
-                else if (i == 1) {
-
-                    // Constant row
-
-                    h_in[i * N + j] = 1000.0f;
-                }
-                else {
-
-                    h_in[i * N + j] =
-                        static_cast<float>(j % 23)
-                        * 0.2f - 2.0f;
-                }
+                if (i == 0) h_in[i * N + j] = static_cast<float>(j % 17) * 0.1f;
+                else if (i == 1) h_in[i * N + j] = 1000.0f;
+                else h_in[i * N + j] = static_cast<float>(j % 23) * 0.2f - 2.0f;
             }
         }
 
-        // -----------------------------------------------------
-        // Allocate tensors
-        // -----------------------------------------------------
+        tinyml::Tensor<float> input(queue, {M, N});
+        tinyml::Tensor<float> gamma(queue, {N});
+        tinyml::Tensor<float> beta(queue, {N});
+        tinyml::Tensor<float> output_serial(queue, {M, N});
+        tinyml::Tensor<float> output_parallel(queue, {M, N});
 
-        tinyml::Tensor<float> input(queue, {M,N});
-        tinyml::Tensor<float> gamma(queue,{N});
-        tinyml::Tensor<float> beta(queue,{N});
+        std::vector<float> h_gamma(N, 1.0f);
+        std::vector<float> h_beta(N, 0.0f);
 
-        tinyml::Tensor<float> output_serial(
-            queue, {M,N});
+        sycl::event e_input = ops::copy_to_device(queue, input, h_in.data());
+        sycl::event e_gamma = ops::copy_to_device(queue, gamma, h_gamma.data());
+        sycl::event e_beta = ops::copy_to_device(queue, beta, h_beta.data());
 
-        tinyml::Tensor<float> output_parallel(
-            queue, {M,N});
-
-        // -----------------------------------------------------
-        // Copy input to GPU
-        // -----------------------------------------------------
-        std::vector<float> h_gamma(N,1.0f);
-        std::vector<float> h_beta(N,0.0f);
-
-        sycl::event e_input = ops::copy_to_device(queue,input,h_in.data());
-        sycl::event e_gamma=ops::copy_to_device(queue,gamma,h_gamma.data());
-        sycl::event e_beta=ops::copy_to_device(queue,beta,h_beta.data());
-        // -----------------------------------------------------
-        // Serial LayerNorm
-        // -----------------------------------------------------
-
-        sycl::event e_serial =
-            ops::layer_norm(
-                queue,
-                input,
-                output_serial,
-                group_size,
-                {e_input}
-            );
-
-        // -----------------------------------------------------
-        // Parallel LayerNorm
-        // -----------------------------------------------------
-
-        sycl::event e_parallel = ops::layer_norm_parallel(queue,input,gamma,beta,output_parallel,group_size,{e_input,e_gamma,e_beta});
-
-        // -----------------------------------------------------
-        // Copy results to CPU
-        // -----------------------------------------------------
+        sycl::event e_serial = ops::layer_norm(queue, input, output_serial, group_size, {e_input});
+        sycl::event e_parallel = ops::layer_norm_parallel(queue, input, gamma, beta, output_parallel, group_size, {e_input, e_gamma, e_beta});
 
         std::vector<float> h_serial(M * N);
         std::vector<float> h_parallel(M * N);
 
-        sycl::event e_serial_copy =
-            ops::copy_to_host(
-                queue,
-                h_serial.data(),
-                output_serial,
-                {e_serial}
-            );
-
-        sycl::event e_parallel_copy =
-            ops::copy_to_host(
-                queue,
-                h_parallel.data(),
-                output_parallel,
-                {e_parallel}
-            );
+        sycl::event e_serial_copy = ops::copy_to_host(queue, h_serial.data(), output_serial, {e_serial});
+        sycl::event e_parallel_copy = ops::copy_to_host(queue, h_parallel.data(), output_parallel, {e_parallel});
 
         e_serial_copy.wait_and_throw();
         e_parallel_copy.wait_and_throw();
 
-        // -----------------------------------------------------
-        // Independent CPU reference
-        // -----------------------------------------------------
+        // Diagnostic: inspect actual GPU input, gamma, beta, and output.
+        std::vector<float> debug_input(M * N);
+        std::vector<float> debug_gamma(N);
+        std::vector<float> debug_beta(N);
+
+        queue.memcpy(debug_input.data(), input.data(), M * N * sizeof(float)).wait_and_throw();
+        queue.memcpy(debug_gamma.data(), gamma.data(), N * sizeof(float)).wait_and_throw();
+        queue.memcpy(debug_beta.data(), beta.data(), N * sizeof(float)).wait_and_throw();
+
+        std::cout << std::setprecision(10);
+        std::cout << "\nDEBUG constant row:\n";
+        for (std::size_t j = 0; j < 8; j++) {
+            std::cout << "j=" << j
+                      << " input=" << debug_input[N + j]
+                      << " gamma=" << debug_gamma[j]
+                      << " beta=" << debug_beta[j]
+                      << " output=" << h_parallel[N + j] << '\n';
+        }
 
         std::vector<float> h_reference(M * N);
-
         std::vector<double> cpu_mean(M);
         std::vector<double> cpu_variance(M);
 
         for (std::size_t i = 0; i < M; i++) {
-
             double sum = 0.0;
+            for (std::size_t j = 0; j < N; j++) sum += static_cast<double>(h_in[i * N + j]);
 
-            for (std::size_t j = 0; j < N; j++) {
-
-                sum +=
-                    static_cast<double>(
-                        h_in[i * N + j]
-                    );
-            }
-
-            double mean =
-                sum / static_cast<double>(N);
-
+            double mean = sum / static_cast<double>(N);
             double variance = 0.0;
 
             for (std::size_t j = 0; j < N; j++) {
-
-                double diff =
-                    static_cast<double>(
-                        h_in[i * N + j]
-                    ) - mean;
-
+                double diff = static_cast<double>(h_in[i * N + j]) - mean;
                 variance += diff * diff;
             }
 
             variance /= static_cast<double>(N);
-
             cpu_mean[i] = mean;
             cpu_variance[i] = variance;
 
-            double denominator =
-                std::sqrt(
-                    variance + static_cast<double>(epsilon)
-                );
+            double denominator = std::sqrt(variance + static_cast<double>(epsilon));
 
             for (std::size_t j = 0; j < N; j++) {
-
-                h_reference[i * N + j] =
-                    static_cast<float>(
-                        (static_cast<double>(
-                            h_in[i * N + j]
-                        ) - mean) / denominator
-                    );
+                h_reference[i * N + j] = static_cast<float>((static_cast<double>(h_in[i * N + j]) - mean) / denominator);
             }
         }
-
-        // -----------------------------------------------------
-        // Numerical validation
-        // -----------------------------------------------------
 
         float max_serial_parallel_diff = 0.0f;
         float max_serial_reference_diff = 0.0f;
         float max_parallel_reference_diff = 0.0f;
-
         bool finite_results = true;
-
         std::size_t max_error_row = 0;
         std::size_t max_error_col = 0;
 
         for (std::size_t i = 0; i < M * N; i++) {
-
-            if (!std::isfinite(h_serial[i]) ||
-                !std::isfinite(h_parallel[i]) ||
-                !std::isfinite(h_reference[i]))
-            {
+            if (!std::isfinite(h_serial[i]) || !std::isfinite(h_parallel[i]) || !std::isfinite(h_reference[i])) {
                 finite_results = false;
                 continue;
             }
 
-            float serial_parallel_diff =
-                std::abs(
-                    h_serial[i] - h_parallel[i]
-                );
+            max_serial_parallel_diff = std::max(max_serial_parallel_diff, std::abs(h_serial[i] - h_parallel[i]));
+            max_serial_reference_diff = std::max(max_serial_reference_diff, std::abs(h_serial[i] - h_reference[i]));
 
-            float serial_reference_diff =
-                std::abs(
-                    h_serial[i] - h_reference[i]
-                );
-
-            float parallel_reference_diff =
-                std::abs(
-                    h_parallel[i] - h_reference[i]
-                );
-
-            max_serial_parallel_diff =
-                std::max(
-                    max_serial_parallel_diff,
-                    serial_parallel_diff
-                );
-
-            max_serial_reference_diff =
-                std::max(
-                    max_serial_reference_diff,
-                    serial_reference_diff
-                );
-
-            if (parallel_reference_diff >
-                max_parallel_reference_diff)
-            {
-                max_parallel_reference_diff =
-                    parallel_reference_diff;
-
+            float diff = std::abs(h_parallel[i] - h_reference[i]);
+            if (diff > max_parallel_reference_diff) {
+                max_parallel_reference_diff = diff;
                 max_error_row = i / N;
                 max_error_col = i % N;
             }
         }
 
-        std::cout
-            << "Maximum serial vs parallel difference: "
-            << max_serial_parallel_diff << "\n";
-
-        std::cout
-            << "Maximum serial vs CPU reference difference: "
-            << max_serial_reference_diff << "\n";
-
-        std::cout
-            << "Maximum parallel vs CPU reference difference: "
-            << max_parallel_reference_diff << "\n";
-
-        std::cout
-            << "Maximum parallel error location: row "
-            << max_error_row
-            << ", column "
-            << max_error_col
-            << "\n";
-
-        // -----------------------------------------------------
-        // Per-row validation
-        // -----------------------------------------------------
+        std::cout << "Maximum serial vs parallel difference: " << max_serial_parallel_diff << "\n";
+        std::cout << "Maximum serial vs CPU reference difference: " << max_serial_reference_diff << "\n";
+        std::cout << "Maximum parallel vs CPU reference difference: " << max_parallel_reference_diff << "\n";
+        std::cout << "Maximum parallel error location: row " << max_error_row << ", column " << max_error_col << "\n";
 
         bool nonconstant_rows_passed = true;
         bool constant_row_passed = true;
 
         for (std::size_t i = 0; i < M; i++) {
-
             float max_row_diff = 0.0f;
-
             double row_mean = 0.0;
             double row_variance = 0.0;
 
             for (std::size_t j = 0; j < N; j++) {
-
-                float diff =
-                    std::abs(
-                        h_parallel[i * N + j] -
-                        h_reference[i * N + j]
-                    );
-
-                max_row_diff =
-                    std::max(max_row_diff, diff);
-
-                row_mean +=
-                    static_cast<double>(
-                        h_parallel[i * N + j]
-                    );
+                float diff = std::abs(h_parallel[i * N + j] - h_reference[i * N + j]);
+                max_row_diff = std::max(max_row_diff, diff);
+                row_mean += static_cast<double>(h_parallel[i * N + j]);
             }
 
             row_mean /= static_cast<double>(N);
 
             for (std::size_t j = 0; j < N; j++) {
-
-                double diff =
-                    static_cast<double>(
-                        h_parallel[i * N + j]
-                    ) - row_mean;
-
+                double diff = static_cast<double>(h_parallel[i * N + j]) - row_mean;
                 row_variance += diff * diff;
             }
 
             row_variance /= static_cast<double>(N);
+            double expected_variance = cpu_variance[i] / (cpu_variance[i] + static_cast<double>(epsilon));
 
-            double expected_variance =
-                cpu_variance[i] /
-                (cpu_variance[i] +
-                 static_cast<double>(epsilon));
-
-            std::cout
-                << "\nRow " << i << "\n";
-
-            std::cout
-                << "CPU mean:           "
-                << cpu_mean[i] << "\n";
-
-            std::cout
-                << "CPU variance:       "
-                << cpu_variance[i] << "\n";
-
-            std::cout
-                << "Output mean:        "
-                << row_mean << "\n";
-
-            std::cout
-                << "Output variance:    "
-                << row_variance << "\n";
-
-            std::cout
-                << "Expected variance:  "
-                << expected_variance << "\n";
-
-            std::cout
-                << "Maximum row error:  "
-                << max_row_diff << "\n";
+            std::cout << "\nRow " << i << "\n";
+            std::cout << "CPU mean:           " << cpu_mean[i] << "\n";
+            std::cout << "CPU variance:       " << cpu_variance[i] << "\n";
+            std::cout << "Output mean:        " << row_mean << "\n";
+            std::cout << "Output variance:    " << row_variance << "\n";
+            std::cout << "Expected variance:  " << expected_variance << "\n";
+            std::cout << "Maximum row error:  " << max_row_diff << "\n";
 
             if (i == 1) {
-
-                if (max_row_diff < tolerance) {
-
-                    std::cout
-                        << "Constant row test PASSED\n";
-                }
+                if (max_row_diff < tolerance) std::cout << "Constant row test PASSED\n";
                 else {
-
-                    std::cout
-                        << "Constant row test FAILED\n";
-
+                    std::cout << "Constant row test FAILED\n";
                     constant_row_passed = false;
                 }
-            }
-            else {
-
-                if (max_row_diff < tolerance) {
-
-                    std::cout
-                        << "Row " << i
-                        << " test PASSED\n";
-                }
+            } else {
+                if (max_row_diff < tolerance) std::cout << "Row " << i << " test PASSED\n";
                 else {
-
-                    std::cout
-                        << "Row " << i
-                        << " test FAILED\n";
-
+                    std::cout << "Row " << i << " test FAILED\n";
                     nonconstant_rows_passed = false;
                 }
             }
         }
 
-        // -----------------------------------------------------
-        // Final validation
-        // -----------------------------------------------------
-
-        if (finite_results &&
-            nonconstant_rows_passed &&
-            constant_row_passed &&
+        if (finite_results && nonconstant_rows_passed && constant_row_passed &&
             max_serial_parallel_diff < tolerance &&
             max_serial_reference_diff < tolerance &&
-            max_parallel_reference_diff < tolerance)
-        {
-            std::cout
-                << "\nParallel LayerNorm test PASSED\n";
-        }
-        else {
-
-            std::cout
-                << "\nParallel LayerNorm test FAILED\n";
-
+            max_parallel_reference_diff < tolerance) {
+            std::cout << "\nParallel LayerNorm test PASSED\n";
+        } else {
+            std::cout << "\nParallel LayerNorm test FAILED\n";
             all_tests_passed = false;
         }
     }
